@@ -139,6 +139,8 @@ def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # The recorder and a backfill crawl are expected to run at the same time.
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
@@ -226,7 +228,15 @@ _ODDS_COLS = (
 )
 
 # A snapshot is re-written only when one of these differs from the previous snapshot.
-_CHANGE_COLS = ("price_american", "points", "limit_amount", "status", "is_live")
+# `cutoff_at` belongs here: Pinnacle pushes a market's cutoff forward as a series
+# progresses, and that push is the signal for whether a map stays biddable through its
+# draft. Dropping it because the price happened not to move would lose the measurement.
+_CHANGE_COLS = ("price_american", "points", "limit_amount", "status", "is_live", "cutoff_at")
+
+# Written when a previously-open line vanishes from a poll. A bookmaker pulling a market
+# (suspension during a fight, or the map going off the board) is a real, timed event, and
+# without a row for it "suspended" is indistinguishable from "unchanged".
+TOMBSTONE_STATUS = "gone"
 
 
 def insert_odds_snapshots(
@@ -258,6 +268,59 @@ def insert_odds_snapshots(
         written += 1
     conn.commit()
     return written, skipped
+
+
+def open_lines(conn: sqlite3.Connection, source_prefix: str) -> list[sqlite3.Row]:
+    """Latest snapshot of every line for `source_prefix` that has not been tombstoned.
+
+    The prefix match covers sources that fan out per bookmaker (``theoddsapi:<book>``).
+    """
+    return conn.execute(
+        "SELECT * FROM ("
+        "  SELECT *, ROW_NUMBER() OVER ("
+        "    PARTITION BY source, line_key ORDER BY captured_at DESC, id DESC"
+        "  ) rn FROM odds_snapshots WHERE source LIKE ?"
+        ") WHERE rn = 1 AND status IS NOT ?",
+        (f"{source_prefix}%", TOMBSTONE_STATUS),
+    ).fetchall()
+
+
+def write_tombstones(
+    conn: sqlite3.Connection,
+    source_prefix: str,
+    seen_line_keys: Iterable[str],
+    captured_at: int | None = None,
+) -> int:
+    """Mark lines that were open but are absent from this poll as gone.
+
+    Carries the last-known identity of the line forward with a null price so the gap is
+    queryable as an interval. A line that comes back is written normally on the next
+    poll, because its status differs from the tombstone.
+    """
+    captured_at = captured_at or int(time.time())
+    seen = set(seen_line_keys)
+    written = 0
+    for prev in open_lines(conn, source_prefix):
+        if prev["line_key"] in seen:
+            continue
+        row = {c: prev[c] for c in _ODDS_COLS}
+        row.update(
+            {
+                "status": TOMBSTONE_STATUS,
+                "price_american": None,
+                "price_decimal": None,
+                "limit_amount": None,
+                "captured_at": captured_at,
+            }
+        )
+        conn.execute(
+            f"INSERT INTO odds_snapshots ({','.join(_ODDS_COLS)}) "  # noqa: S608
+            f"VALUES ({','.join('?' * len(_ODDS_COLS))})",
+            tuple(row[c] for c in _ODDS_COLS),
+        )
+        written += 1
+    conn.commit()
+    return written
 
 
 def matches_needing_detail(conn: sqlite3.Connection, limit: int = 100) -> list[int]:

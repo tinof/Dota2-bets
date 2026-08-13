@@ -57,9 +57,14 @@ class PinnacleFetcher:
         markets = self._get(f"/sports/{self.sport_id}/markets/straight")
         return matchups, markets
 
-    def fetch(self) -> list[dict[str, Any]]:
+    def fetch_with_raw(self) -> tuple[list[dict[str, Any]], Any]:
+        """Quotes plus the exact payload they came from, for the archive."""
         matchups, markets = self.raw()
-        return normalise(matchups, markets, league_filter=self.league_filter)
+        quotes = normalise(matchups, markets, league_filter=self.league_filter)
+        return quotes, {"matchups": matchups, "markets": markets}
+
+    def fetch(self) -> list[dict[str, Any]]:
+        return self.fetch_with_raw()[0]
 
 
 def _participant_names(matchup: dict[str, Any]) -> tuple[str | None, str | None]:

@@ -71,8 +71,13 @@ class TheOddsApiFetcher:
             log.info("The Odds API quota remaining: %s", remaining)
         return resp.json()
 
+    def fetch_with_raw(self) -> tuple[list[dict[str, Any]], Any]:
+        """Quotes plus the exact payload they came from, for the archive."""
+        events = self.raw()
+        return normalise(events), events
+
     def fetch(self) -> list[dict[str, Any]]:
-        return normalise(self.raw())
+        return self.fetch_with_raw()[0]
 
 
 def normalise(events: list[dict[str, Any]]) -> list[dict[str, Any]]:

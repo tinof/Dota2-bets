@@ -8,30 +8,6 @@ from dota2bets import storage
 from dota2bets.opendota import parse_match_detail, parse_match_summary
 
 
-def quote(**over):
-    q = {
-        "source": "pinnacle",
-        "line_key": "1|Regular|moneyline|0|Spirit|",
-        "event_id": "1",
-        "league": "Dota 2 - The International",
-        "home": "Spirit",
-        "away": "Aurora",
-        "start_time": "2026-08-14T02:00:00Z",
-        "market_type": "moneyline",
-        "period": 0,
-        "units": "Regular",
-        "selection": "Spirit",
-        "points": None,
-        "price_american": -150,
-        "limit_amount": 500,
-        "is_live": 0,
-        "status": "open",
-        "cutoff_at": "2026-08-14T02:00:00Z",
-    }
-    q.update(over)
-    return q
-
-
 @pytest.mark.parametrize(
     ("american", "expected"),
     [(100, 2.0), (-100, 2.0), (200, 3.0), (-200, 1.5), (None, None)],
@@ -89,14 +65,14 @@ def test_matches_needing_detail_finds_summary_only_rows(conn, pro_matches):
     assert len(storage.matches_needing_detail(conn)) == len(pro_matches)
 
 
-def test_unchanged_odds_are_not_rewritten(conn):
+def test_unchanged_odds_are_not_rewritten(conn, quote):
     written, skipped = storage.insert_odds_snapshots(conn, [quote()], captured_at=100)
     assert (written, skipped) == (1, 0)
     written, skipped = storage.insert_odds_snapshots(conn, [quote()], captured_at=160)
     assert (written, skipped) == (0, 1)
 
 
-def test_price_move_writes_a_new_snapshot(conn):
+def test_price_move_writes_a_new_snapshot(conn, quote):
     storage.insert_odds_snapshots(conn, [quote()], captured_at=100)
     written, _ = storage.insert_odds_snapshots(conn, [quote(price_american=-165)], captured_at=160)
     assert written == 1
@@ -107,7 +83,7 @@ def test_price_move_writes_a_new_snapshot(conn):
     assert rows[0]["price_decimal"] == pytest.approx(1.6667, abs=1e-4)
 
 
-def test_limit_and_status_changes_are_tracked(conn):
+def test_limit_and_status_changes_are_tracked(conn, quote):
     storage.insert_odds_snapshots(conn, [quote()], captured_at=100)
     written, _ = storage.insert_odds_snapshots(conn, [quote(status="closed")], captured_at=160)
     assert written == 1
@@ -117,7 +93,7 @@ def test_limit_and_status_changes_are_tracked(conn):
     assert written == 1
 
 
-def test_distinct_lines_are_independent_series(conn):
+def test_distinct_lines_are_independent_series(conn, quote):
     a = quote()
     b = quote(line_key="1|Regular|moneyline|0|Aurora|", selection="Aurora", price_american=130)
     written, _ = storage.insert_odds_snapshots(conn, [a, b], captured_at=100)

@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from types import FrameType
 
-from . import storage
+from . import archive, storage
 from .odds import build_fetchers
 from .opendota import OpenDotaClient, parse_match_detail, parse_match_summary
 
@@ -105,29 +105,50 @@ def cmd_record_odds(args: argparse.Namespace) -> int:
         f"into {args.db} (Ctrl-C to stop)."
     )
     cycles = 0
+    last_archived: dict[str, int] = {}
     try:
         while not _stop:
             captured_at = int(time.time())
-            total_written = total_skipped = 0
+            total_written = total_skipped = total_gone = 0
+            any_live = False
             for fetcher in fetchers:
                 try:
-                    quotes = fetcher.fetch()
+                    quotes, raw = fetcher.fetch_with_raw()
                 except Exception as exc:  # noqa: BLE001 - keep the loop alive
                     log.warning("%s fetch failed: %s", fetcher.name, exc)
                     continue
                 written, skipped = storage.insert_odds_snapshots(conn, quotes, captured_at)
+                # Only tombstone after a successful fetch; a failed poll means we know
+                # nothing about those lines, which is not the same as them being pulled.
+                gone = storage.write_tombstones(
+                    conn, fetcher.name, (q["line_key"] for q in quotes), captured_at
+                )
+                # Archive payloads that changed something, plus an hourly heartbeat.
+                # Archiving every poll would cost gigabytes across an event for copies
+                # of a market that never moved.
+                due = captured_at - last_archived.get(fetcher.name, 0) >= args.archive_heartbeat
+                if not args.no_archive and (written or gone or due):
+                    try:
+                        archive.write_payload(args.archive_root, fetcher.name, captured_at, raw)
+                        last_archived[fetcher.name] = captured_at
+                    except OSError as exc:
+                        log.warning("archiving %s failed: %s", fetcher.name, exc)
                 total_written += written
                 total_skipped += skipped
+                total_gone += gone
+                any_live |= any(q.get("is_live") for q in quotes)
             cycles += 1
             stamp = time.strftime("%H:%M:%S", time.localtime(captured_at))
             print(
-                f"[{stamp}] cycle {cycles}: {total_written} new snapshots, "
-                f"{total_skipped} unchanged",
+                f"[{stamp}] cycle {cycles}: {total_written} new, {total_skipped} unchanged, "
+                f"{total_gone} gone{' [LIVE]' if any_live else ''}",
                 flush=True,
             )
             if args.once:
                 break
-            for _ in range(args.interval):
+            # Live markets move in seconds; pre-match lines drift over minutes.
+            delay = args.live_interval if any_live else args.interval
+            for _ in range(delay):
                 if _stop:
                     break
                 time.sleep(1)
@@ -178,6 +199,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("record-odds", help="poll odds sources and record line movements")
     p.add_argument("--sources", nargs="+", default=["pinnacle"])
     p.add_argument("--interval", type=int, default=60, help="seconds between polls")
+    p.add_argument(
+        "--live-interval", type=int, default=20, help="seconds between polls while a game is live"
+    )
+    p.add_argument("--archive-root", default=str(archive.DEFAULT_ARCHIVE_ROOT))
+    p.add_argument("--no-archive", action="store_true", help="skip raw payload archiving")
+    p.add_argument(
+        "--archive-heartbeat",
+        type=int,
+        default=3600,
+        help="archive an unchanged payload at least this often (seconds)",
+    )
     p.add_argument("--once", action="store_true", help="single cycle then exit")
     p.set_defaults(func=cmd_record_odds)
 
@@ -190,8 +222,11 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s %(name)s: %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    if not args.verbose:
+        # One request line per poll per endpoint would dominate a long recorder log.
+        logging.getLogger("httpx").setLevel(logging.WARNING)
     return args.func(args)
 
 

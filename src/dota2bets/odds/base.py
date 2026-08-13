@@ -25,4 +25,12 @@ class OddsFetcher(Protocol):
         """Return the current quotes for all available Dota 2 markets."""
         ...
 
+    def fetch_with_raw(self) -> tuple[list[dict[str, Any]], Any]:
+        """Same as `fetch`, plus the raw payload so the recorder can archive it.
+
+        Implemented alongside `fetch` rather than by calling it, so that archiving
+        costs no extra HTTP requests.
+        """
+        ...
+
     def close(self) -> None: ...
