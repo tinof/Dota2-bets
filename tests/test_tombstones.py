@@ -60,9 +60,7 @@ def test_line_returning_at_an_unchanged_price_is_still_recorded(conn, quote):
 def test_tombstone_preserves_line_identity(conn, quote):
     storage.insert_odds_snapshots(conn, [quote()], captured_at=100)
     storage.write_tombstones(conn, "pinnacle", [], captured_at=160)
-    row = conn.execute(
-        "SELECT * FROM odds_snapshots WHERE status='gone'"
-    ).fetchone()
+    row = conn.execute("SELECT * FROM odds_snapshots WHERE status='gone'").fetchone()
     assert (row["home"], row["away"], row["selection"]) == ("Spirit", "Aurora", "Spirit")
     assert row["market_type"] == "moneyline"
     assert row["price_decimal"] is None

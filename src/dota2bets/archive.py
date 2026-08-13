@@ -23,9 +23,7 @@ def archive_path(root: Path | str, source: str, captured_at: int) -> Path:
     return Path(root) / source / day / f"{captured_at}.json.gz"
 
 
-def write_payload(
-    root: Path | str, source: str, captured_at: int, payload: Any
-) -> Path:
+def write_payload(root: Path | str, source: str, captured_at: int, payload: Any) -> Path:
     path = archive_path(root, source, captured_at)
     path.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(path, "wt", encoding="utf-8") as fh:
