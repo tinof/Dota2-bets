@@ -5,6 +5,8 @@ dota2bets detail --limit 100             # drafts, players, per-minute series
 dota2bets record-odds                    # long-running line recorder
 dota2bets resolve                        # join odds events to teams and series
 dota2bets eval                           # closing lines, de-vig, CLV/Brier
+dota2bets backtest                       # walk-forward score of the ratings model
+dota2bets predict --out preds.jsonl      # pre-match predictions for a live event
 dota2bets status                         # what is in the database
 """
 
@@ -13,12 +15,13 @@ from __future__ import annotations
 import argparse
 import logging
 import signal
+import sqlite3
 import sys
 import time
 from pathlib import Path
 from types import FrameType
 
-from . import aliases, archive, evaluation, storage
+from . import aliases, archive, backtest, evaluation, ratings, storage
 from .odds import build_fetchers
 from .opendota import OpenDotaClient, parse_match_detail, parse_match_summary
 
@@ -294,6 +297,121 @@ def cmd_eval(args: argparse.Namespace) -> int:
     return 0 if report.n_scored else 1
 
 
+def _config_from_args(args: argparse.Namespace) -> ratings.Glicko2Config:
+    return ratings.Glicko2Config(
+        tau=args.tau,
+        idle_period_s=None if args.idle_days is None else args.idle_days * 86400.0,
+        initial_rd=args.initial_rd,
+    )
+
+
+def _holdout_start(conn: sqlite3.Connection, league: str) -> int | None:
+    """First horn of the target event -- the walk-forward must never cross it."""
+    row = conn.execute(
+        "SELECT MIN(start_time) FROM matches WHERE league_name = ?", (league,)
+    ).fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
+def _print_scorecard(label: str, card: backtest.ScoreCard) -> None:
+    if not card.n:
+        print(f"  {label:<12} no scored maps")
+        return
+    print(
+        f"  {label:<12} n={card.n:<6} Brier {card.brier:.4f}  "
+        f"log-loss {card.log_loss:.4f}  (coin flip {card.baseline_brier:.4f})"
+    )
+
+
+def cmd_backtest(args: argparse.Namespace) -> int:
+    """Walk-forward the ratings model over history, bounded before the target event."""
+    conn = storage.connect_ro(args.db)
+    burn_in = int(time.mktime(time.strptime(args.burn_in, "%Y-%m-%d")))
+    end = _holdout_start(conn, args.league)
+    if end is None:
+        log.warning("no matches for league %r; scoring the whole history", args.league)
+    else:
+        print(f"holdout: nothing at or after {time.strftime('%Y-%m-%d', time.localtime(end))}")
+
+    score_leagues = None if args.score == "all" else backtest.elite_league_ids(conn)
+    scope = "all leagues" if score_leagues is None else f"{len(score_leagues)} top-tier leagues"
+    print(f"scoring on {scope}, teams with >= {args.min_games} prior maps")
+
+    if args.tune:
+        grid = backtest.default_grid()
+        print(f"tuning {len(grid)} configs on maps from {args.burn_in}, ranked by log-loss")
+        results = backtest.tune(
+            conn,
+            grid,
+            start_scoring=burn_in,
+            end=end,
+            score_leagues=score_leagues,
+            min_games=args.min_games,
+        )
+        print(f"{'tau':>5} {'idle_d':>7} {'rd0':>5} {'n':>7} {'Brier':>8} {'log-loss':>9}")
+        for config, card in results:
+            idle = "-" if config.idle_period_s is None else f"{config.idle_period_s / 86400:.0f}"
+            print(
+                f"{config.tau:>5.1f} {idle:>7} {config.initial_rd:>5.0f} {card.n:>7} "
+                f"{card.brier:>8.4f} {card.log_loss:>9.4f}"
+            )
+        best = results[0][0]
+        print(
+            f"\nbest: tau={best.tau} idle_days="
+            f"{'none' if best.idle_period_s is None else best.idle_period_s / 86400:.0f}"
+            f" initial_rd={best.initial_rd:.0f}"
+        )
+        return 0
+
+    card = backtest.walk_forward(
+        conn,
+        _config_from_args(args),
+        start_scoring=burn_in,
+        end=end,
+        score_leagues=score_leagues,
+        min_games=args.min_games,
+    )
+    print(f"walk-forward from {args.burn_in} (predict-then-update, no lookahead)")
+    _print_scorecard("history", card)
+    return 0 if card.n else 1
+
+
+def cmd_predict(args: argparse.Namespace) -> int:
+    """Freeze ratings before each series of an event and emit eval-ready predictions."""
+    conn = storage.connect_ro(args.db)
+    league_id = args.league_id or backtest.league_id_for(conn, args.league)
+    if league_id is None:
+        print(f"no matches found for league {args.league!r}")
+        return 1
+    config = _config_from_args(args)
+
+    report = backtest.match_report(conn, league_id, config, source=args.source)
+    print(f"league {league_id} ({args.league}) -- all decided maps, outcome-only")
+    _print_scorecard("overall", report.overall)
+    for day, card in report.by_day:
+        _print_scorecard(day, card)
+
+    preds = backtest.event_predictions(conn, league_id, config, source=args.source)
+    if args.out:
+        n = backtest.write_predictions(args.out, preds)
+        print(f"\nwrote {n} predictions to {args.out}")
+        print(f"  next: dota2bets eval --predictions {args.out}   <- the bar is closing Brier")
+    return 0
+
+
+def _add_model_args(p: argparse.ArgumentParser) -> None:
+    defaults = ratings.Glicko2Config()
+    p.add_argument("--tau", type=float, default=defaults.tau)
+    p.add_argument(
+        "--idle-days",
+        type=float,
+        default=None if defaults.idle_period_s is None else defaults.idle_period_s / 86400,
+        help="days of idleness that inflate RD by one rating period (omit to disable)",
+    )
+    p.add_argument("--initial-rd", type=float, default=defaults.initial_rd)
+    p.add_argument("--league", default=backtest.DEFAULT_LEAGUE_NAME, help="exact league_name")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dota2bets", description=__doc__)
     parser.add_argument("--db", default=str(storage.DEFAULT_DB_PATH), help="SQLite path")
@@ -360,6 +478,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds before a map's horn to cut the closing line at (pre-draft evaluation)",
     )
     p.set_defaults(func=cmd_eval)
+
+    p = sub.add_parser("backtest", help="walk-forward score of the ratings model")
+    _add_model_args(p)
+    p.add_argument("--tune", action="store_true", help="grid search, ranked by log-loss")
+    p.add_argument(
+        "--score",
+        choices=["elite", "all"],
+        default="elite",
+        help="which leagues to measure on; all rows train either way",
+    )
+    p.add_argument(
+        "--min-games",
+        type=int,
+        default=20,
+        help="only score matches where both teams have at least this many prior maps",
+    )
+    p.add_argument("--burn-in", default="2024-10-01", help="start scoring after this date")
+    p.set_defaults(func=cmd_backtest)
+
+    p = sub.add_parser("predict", help="pre-match predictions for a league, for eval")
+    _add_model_args(p)
+    p.add_argument("--league-id", type=int, default=None, help="overrides --league")
+    p.add_argument("--source", default="pinnacle")
+    p.add_argument("--out", default=None, help="write predictions JSONL here")
+    p.set_defaults(func=cmd_predict)
 
     p = sub.add_parser("status", help="show database contents")
     p.set_defaults(func=cmd_status)

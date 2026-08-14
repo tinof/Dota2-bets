@@ -66,6 +66,7 @@ def test_rosters_link_players_to_their_own_team(match_detail):
     }
     assert radiant == radiant_players
 
+
 def test_rate_limit_backoff_is_exponential_and_honours_retry_after(monkeypatch):
     """A sustained throttle must not end a long crawl after a few seconds of waiting."""
     from dota2bets import opendota

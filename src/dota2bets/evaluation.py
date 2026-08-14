@@ -43,7 +43,10 @@ from .storage import parse_ts
 
 log = logging.getLogger(__name__)
 
-#: OpenDota `series_type` -> map wins needed to take the series.
+#: OpenDota `series_type` -> map wins needed to take the series. Type 3 (best-of-two)
+#: is deliberately absent: it can end 1-1, so there is no series winner to resolve.
+#: Defaulting it to 1 would crown the map-1 winner, silently scoring a series bet that
+#: never settled.
 WINS_NEEDED = {0: 1, 1: 2, 2: 3}
 
 
@@ -333,7 +336,9 @@ def resolve_outcome(
         if outcome is None:
             return None, "map undecided or team not in match"
         return outcome, None
-    needed = WINS_NEEDED.get(maps[0]["series_type"] or 0, 1)
+    needed = WINS_NEEDED.get(maps[0]["series_type"] or 0)
+    if needed is None:
+        return None, "series format has no winner"
     wins = 0
     others = 0
     for row in maps:
