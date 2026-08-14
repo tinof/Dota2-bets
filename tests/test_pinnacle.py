@@ -32,6 +32,22 @@ def test_totals_keep_designation_and_points(pinnacle_payload):
         assert all(q["points"] is not None for q in totals)
 
 
+def test_team_total_sides_get_distinct_line_keys(pinnacle_payload):
+    """A team_total's team lives on the market, not the price.
+
+    Both sides of a period quote over/under at the same points, so dropping `side`
+    collapses two independent markets onto one line_key and their prices thrash.
+    """
+    quotes = normalise(pinnacle_payload["matchups"], pinnacle_payload["markets"])
+    tt = [q for q in quotes if q["market_type"] == "team_total"]
+    assert tt, "fixture should contain team_total markets"
+    assert len({q["line_key"] for q in tt}) == len(tt)
+    for q in tt:
+        team, _, designation = q["selection"].partition(":")
+        assert team in (q["home"], q["away"])
+        assert designation in ("over", "under")
+
+
 def test_line_keys_are_unique_per_poll(pinnacle_payload):
     quotes = normalise(pinnacle_payload["matchups"], pinnacle_payload["markets"])
     keys = [q["line_key"] for q in quotes]

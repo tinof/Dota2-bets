@@ -1,95 +1,133 @@
 # Dev handoff
 
-State as of 2026-08-13 20:35 local. TI 2026 runs 10–23 Aug, so the odds-capture window
-has about ten days left. Read [`research.md`](research.md) for why the project is shaped
+State as of 2026-08-14 13:00 local. TI 2026 runs 10–23 Aug, so the odds-capture window
+has about nine days left. Read [`research.md`](research.md) for why the project is shaped
 this way; this file is only about where the code stands and what to do next.
 
-## Status: the recorder is live
+## Status: recording, resolving, and reporting
 
-`com.dota2bets.recorder` is installed as a launchd agent and **running now**, polling
+`com.dota2bets.recorder` is installed as a launchd agent and **running**, polling
 Pinnacle every 60s (20s while a game is live) into `data/dota2bets.sqlite`, logging to
-`data/recorder.log`. Verified: it respawns after `kill -9` (KeepAlive), writes line
-history across polls, tombstones vanished markets, and archives raw payloads.
+`data/recorder.log`.
 
 ```bash
 launchctl print gui/$(id -u)/com.dota2bets.recorder | grep -E 'state|pid'
 tail -f data/recorder.log
-launchctl bootout gui/$(id -u)/com.dota2bets.recorder     # stop
+launchctl kickstart -k gui/$(id -u)/com.dota2bets.recorder   # restart (picks up code changes)
+launchctl bootout gui/$(id -u)/com.dota2bets.recorder        # stop
 ```
 
 It does **not** prevent sleep. For unattended capture keep the Mac on mains power and
 run `caffeinate -s`, or disable sleep for the event.
 
-Commits: `de68260` (Phase 0), `fd31fda` (handoff), `ff32908` (recorder fidelity),
-plus a formatting commit. 41 tests passing, ruff clean.
+**The three things the last handoff listed as unproven are now proven in the data.** The
+live path executed during TI: `is_live=1` rows exist, the interval tightens to ~20s while
+a game runs, and tombstones appear during live play (market pulls while `is_live=1`), so
+suspensions are being recorded rather than silently blurred into "unchanged".
 
-## What changed this session, and why it mattered
+## What changed this session
 
-An audit found the earlier plan's ordering wrong: it would have run the recorder
-unattended for a week collecting data that **could not answer the question the project
-exists to answer**. Three defects, all now fixed in `ff32908`:
+### A live bug: `team_total` line keys were colliding
 
-1. **`cutoff_at` was not in `storage._CHANGE_COLS`.** Pinnacle pushes a market's cutoff
-   forward as a series progresses — that push is precisely the map-2/3 window signal.
-   It was being discarded whenever the price happened not to move.
-2. **Market removal wrote nothing.** A pulled market (suspension during a fight, or a
-   map going off the board) was indistinguishable from "unchanged". Now
-   `write_tombstones` writes a `status='gone'` row, and a line returning is recorded
-   even at an unchanged price.
-3. **No raw archive.** The normaliser sits in front of an unofficial API that already
-   changed shape once. Payloads are now gzipped to `data/raw/<source>/<date>/` on change
-   plus an hourly heartbeat, so a normalisation bug found later can be fixed by
-   reprocessing rather than losing unrepeatable history.
+Pinnacle puts the *team* of a team-total market on the market as `side: home|away`, while
+the prices only carry `designation: over|under`. `normalise` dropped `side`, so both
+teams' totals at the same points collapsed onto one `line_key` — two independent markets
+overwriting each other's history, ~78 colliding keys per payload, visible as a permanent
+"4 new" every cycle in the recorder log. `selection` is now `"<team>:<over|under>"`, which
+also keeps the key stable the way the moneyline convention does. After restarting the
+recorder the log settled to "0 new, 274 unchanged".
 
-Also: adaptive poll interval, `PRAGMA busy_timeout=5000` so the recorder and a backfill
-crawl can run concurrently, and httpx per-request logging quieted.
+Kills team-total history recorded before this fix is thrashed. It is repairable from the
+raw archive (coverage there is dense precisely *because* the thrash forced archive
+writes) — write `scripts/reprocess_archive.py` if that history turns out to matter.
 
-## Still unproven
+### Entity resolution (`aliases.py` + `aliases.yaml` + `dota2bets resolve`)
 
-- **The live path has never executed.** No `is_live=1` row exists yet, because no match
-  was live during testing. First live TI series: confirm `is_live=1` rows appear, the
-  interval tightens to 20s, and tombstones appear during teamfight suspensions.
-- `theoddsapi` source is written but never run against the real API.
+Odds events now join to OpenDota series. `resolve` writes `event_series_map` and the
+`v_odds_series` view joins it to `odds_snapshots`. Current run: **36 of 36 events
+resolved to teams, 34 joined to a series, zero unresolved names** (the two unjoined were
+a match not yet played).
+
+Name matching is exact against a curated table — whitespace-collapsed, case-insensitive,
+with `(Kills)` stripped — never fuzzy. A wrong join is silent and corrupts every number
+downstream, so an unknown name is *reported for a human* instead of guessed at. Add the
+team to `aliases.yaml` when `resolve` reports one.
+
+Two structural facts drove the design, both recoverable only from the raw archive:
+
+* **Pinnacle re-lists a series under a new event id when it goes live**, and again for
+  kills markets, linked by `parentId` — a field `normalise` drops. Children inherit their
+  parent's series, so map-2/3 prices quoted under a live child stay attached correctly.
+* **Its `startTime` is the scheduled slot**, drifting up to ~1.2h from when map one
+  actually began, in both directions. The series join is therefore team-pair plus
+  *nearest* start within a tolerance, never equality.
+
+### The window experiment has an answer
+
+`scripts/window_report.py` (reads the DB read-only; safe while recording).
+
+**Map-2 and map-3 moneylines stay open through their drafts — 11 of 11 observed periods
+at 100% coverage, still quoted at the horn, at a median max stake of $2,500 (up to
+$10,000).** Markets do get pulled mid-series — one map-2 line was gone for 23 minutes
+while map 1 ran — but they return before the next draft.
+
+So the Phase 2 draft model has a real window to bet into, and the retarget toward
+live-anchored betting is **not** needed. That was the open strategic question; it is
+closed for now, on nine series of TI data. Re-run the report as more series finish.
+
+### History backfill
+
+2,000 pro-match summaries ingested; a detail crawl (drafts, players, per-minute series)
+is running in the background against the keyless API at ~1 match/second.
+
+**Sourcing decision.** OpenDota's free tier is keyless at 50,000 calls/month and 60/min;
+a registered key is the *paid premium tier* (payment method required) — the earlier
+"register `OPENDOTA_API_KEY` to raise limits" note was optimistic about it being free.
+STRATZ is genuinely free (Steam login: 10,000 calls/day, ~100 matches batched per
+GraphQL call) but needs a new client, parser and fixtures against a different schema.
+
+Recommendation: **pay for an OpenDota key** for a 12–18 month backfill (~13h of crawling,
+zero new code on an already-tested pipeline). The keyless tier is fine for keeping up
+with TI day to day, but a year-scale backfill would consume most of a month's quota.
+Switch to STRATZ only if the key's pricing disappoints at signup.
 
 ## Next steps
 
-**1. Entity resolution — gates every evaluation.** Pinnacle says `Spirit`, `LGD`,
-`Vici`, `Resilience`; OpenDota says `Team Spirit`, `LGD Gaming`, `Vici Gaming`, `Team
-Resilience`. Kills markets appear as parallel pseudo-events (`Spirit (Kills)`). Until an
-alias table joins odds events to `matches` rows — and periods to maps within a series —
-no CLV, no backtest, nothing is computable. Plan: `src/dota2bets/aliases.py` plus a
-checked-in `aliases.yaml`, curated for the 16 TI teams first, with an unresolved-name
-report.
-
-**2. Window-experiment report.** `scripts/window_report.py`: per finished TI series,
-timeline each period — when the cutoff moved, when lines vanished/reappeared, what
-prices did between map starts. Answers whether map-2/3 markets stay biddable through
-their drafts. If yes, Phase 2 proceeds as designed; if no, the draft model retargets
-toward live-anchored betting (Clegg-style market calibration) and exchange venues.
-
-**3. History backfill** (parallel; safe now that `busy_timeout` is set). Detail coverage
-is 8/300 matches spanning 2.5 weeks — training data is effectively absent. Register
-`OPENDOTA_API_KEY` or move to STRATZ GraphQL batching; target 12–18 months.
-
-**4. Evaluation harness before any model.** De-vig (proportional + Shin), CLV joining
-model probabilities to the last pre-cutoff snapshot. Then Phase 1 ratings score against
-it from day one — never raw accuracy.
+1. **Evaluation harness before any model.** De-vig (proportional + Shin) and CLV joining
+   model probabilities to the last pre-cutoff snapshot from the *pre-match* event, never
+   the live child. Sketch in the approved plan at
+   `~/.claude/plans/regarding-the-docs-dev-handoff-md-how-linked-squirrel.md`.
+2. **Finish the backfill** once the key decision is made. Detail coverage is the binding
+   constraint on Phase 1 — training data is still effectively absent.
+3. **Phase 1 ratings** (Glicko-2/Bradley-Terry per patch window + roster stability),
+   scored against the harness from day one — never raw accuracy.
+4. Re-run `dota2bets resolve` and `window_report.py` as TI progresses; both are
+   idempotent and cheap.
 
 ## Gotchas worth not rediscovering
 
 **Reading the DB while the recorder runs: never `cp` the `.sqlite` file alone.** WAL mode
 keeps recent commits in the `-wal` sidecar, so a plain copy reads stale — this produced a
-false "the recorder wrote nothing" panic mid-session. Open the real path read-only
-instead:
+false "the recorder wrote nothing" panic. Open the real path read-only instead
+(`window_report.connect_ro` does this):
 
 ```python
 sqlite3.connect(f"file:{os.path.abspath('data/dota2bets.sqlite')}?mode=ro", uri=True)
 ```
 
-**`kill -TERM` on a `uv run` wrapper does not reach the Python child.** A manual test
-recorder survived its kill and kept writing alongside the launchd service for several
-minutes. Kill the `.venv/bin/dota2bets` PID, or use Ctrl-C. Check for strays with
-`pgrep -fl "dota2bets record-odds"` — expect exactly one `uv` + one python pair.
+**`kill -TERM` on a `uv run` wrapper does not reach the Python child.** Kill the
+`.venv/bin/dota2bets` PID, use Ctrl-C, or `launchctl kickstart -k` for the service. Check
+for strays with `pgrep -fl "dota2bets record-odds"` — expect exactly one `uv` + one
+python pair.
+
+**A period's `cutoff_at` is a placeholder until its map is next.** Pinnacle parks a
+far-future cutoff (hours out, sometimes days) on a period whose map has not been reached,
+then pulls it in as the map approaches. Only cutoffs published while the market is still
+ahead of its map mean anything; `window_report` ignores the rest.
+
+**`status='closed'` is not the same as a tombstone.** `gone` means the line vanished from
+the poll; `closed` means Pinnacle still lists it but is not taking bets. Both are
+un-biddable, only one is a pull.
 
 **Only tombstone after a successful fetch.** A failed poll means we know nothing about
 those lines, which is not the same as them being pulled. `cmd_record_odds` skips the
@@ -106,15 +144,15 @@ rather than `INSERT OR REPLACE`, or a later `/proMatches` sweep nulls `patch` an
 `detail_fetched_at` and silently re-queues expensive refetches.
 
 **OpenDota rate limits are the backfill bottleneck**: one call per match at 1.2s against
-a ~2,000/day free-tier ceiling, so a year-scale backfill is roughly a week of crawling.
-`iter_pro_matches` paging is cheap; only `detail` is expensive.
+50,000 calls/month keyless. `iter_pro_matches` paging is cheap; only `detail` is
+expensive.
 
 **`lane_role` is null until OpenDota parses the replay** — don't assume it is present.
 
-**Kills markets are a secondary target, not a pivot.** They were 336 of 386 captured
-lines, but that is alternate-line quoted depth, not money. Worth modelling in Phase 2
-(draft composition predicts kill volume more directly than it predicts the winner);
-not worth reorganising around.
+**Kills markets are a secondary target, not a pivot.** They dominate captured line count,
+but that is alternate-line quoted depth, not money. Worth modelling in Phase 2 (draft
+composition predicts kill volume more directly than it predicts the winner); not worth
+reorganising around.
 
 **Avoid tier-3 matches** — softest markets, but match-fixing risk makes that softness
 adverse selection rather than edge.
@@ -122,18 +160,19 @@ adverse selection rather than edge.
 ## Commands
 
 ```bash
-uv sync && uv run pytest                        # no network needed
-uv run dota2bets backfill --max-matches 1000
-uv run dota2bets detail --limit 200             # slow; see rate limits
-uv run dota2bets record-odds --once             # single cycle, for debugging
+uv sync && uv run pytest                        # 70 tests, no network needed
+uv run dota2bets backfill --max-matches 2000
+uv run dota2bets detail --limit 2000             # slow; see rate limits
+uv run dota2bets resolve                         # join odds events to teams/series
+uv run dota2bets record-odds --once              # single cycle, for debugging
 uv run dota2bets status
+uv run python scripts/window_report.py           # the draft-window experiment
 ```
 
-Env: `OPENDOTA_API_KEY` (raises rate limits), `ODDS_API_KEY` (enables
-`--sources pinnacle theoddsapi`).
+Env: `OPENDOTA_API_KEY` (paid tier), `ODDS_API_KEY` (enables `--sources pinnacle
+theoddsapi`; still never run against the real API).
 
-## Open question for the user
+## Settled questions
 
-`papers/thesis.pdf` is not a Dota 2 document — it is a 2006 Waikato MSc thesis on
-multi-instance learning, presumably background for the multi-instance-learning esports
-paper. Confirm whether a different thesis was meant to be there.
+`papers/thesis.pdf` (a 2006 Waikato MSc thesis on multi-instance learning) is deliberate
+background reading for the multi-instance-learning esports paper, not a misplaced file.

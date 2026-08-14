@@ -1061,6 +1061,64 @@
    "status": "open",
    "type": "total",
    "version": 3690127905
+  },
+  {
+   "cutoffAt": "2026-08-14T02:00:00+00:00",
+   "isAlternate": false,
+   "key": "s;1;tt;14.5;home",
+   "limits": [
+    {
+     "amount": 250,
+     "type": "maxRiskStake"
+    }
+   ],
+   "matchupId": 1633895060,
+   "period": 1,
+   "prices": [
+    {
+     "designation": "over",
+     "points": 14.5,
+     "price": -115
+    },
+    {
+     "designation": "under",
+     "points": 14.5,
+     "price": -115
+    }
+   ],
+   "side": "home",
+   "status": "open",
+   "type": "team_total",
+   "version": 3690128651
+  },
+  {
+   "cutoffAt": "2026-08-14T02:00:00+00:00",
+   "isAlternate": false,
+   "key": "s;1;tt;14.5;away",
+   "limits": [
+    {
+     "amount": 250,
+     "type": "maxRiskStake"
+    }
+   ],
+   "matchupId": 1633895060,
+   "period": 1,
+   "prices": [
+    {
+     "designation": "over",
+     "points": 14.5,
+     "price": -115
+    },
+    {
+     "designation": "under",
+     "points": 14.5,
+     "price": -115
+    }
+   ],
+   "side": "away",
+   "status": "open",
+   "type": "team_total",
+   "version": 3690128651
   }
  ]
 }

@@ -1,0 +1,59 @@
+# Bookmaker name -> OpenDota team, curated by hand.
+#
+# Pinnacle publishes short names; OpenDota stores registered ones. Matching is
+# whitespace-collapsed and case-insensitive, and a trailing "(Kills)" is stripped
+# before lookup, so only genuinely different words need to be listed as aliases.
+#
+# `name` must be the OpenDota name for the id (that is what `matches` stores).
+# Add a team here the first time `dota2bets resolve` reports it as unresolved.
+#
+# The International 2026 field.
+teams:
+  - team_id: 9467224
+    name: Aurora Gaming
+    aliases: [Aurora]
+  - team_id: 8255888
+    name: BoomBoys
+    aliases: []
+  - team_id: 9964962
+    name: GamerLegion
+    aliases: []
+  - team_id: 10149530
+    name: HULIGANI
+    aliases: []
+  - team_id: 10150413
+    name: Iron Wing
+    aliases: []
+  - team_id: 10150538
+    name: LGD Gaming
+    aliases: [LGD]
+  - team_id: 10136357
+    name: Nigma Galaxy
+    aliases: []
+  - team_id: 2586976
+    name: OG
+    aliases: []
+  - team_id: 9572001
+    name: TEAM VISION
+    aliases: [VISION]
+  - team_id: 9247354
+    name: Team Falcons
+    aliases: [Falcons]
+  - team_id: 2163
+    name: Team Liquid
+    aliases: [Liquid]
+  - team_id: 5017210
+    name: Team Resilience
+    aliases: [Resilience]
+  - team_id: 7119388
+    name: Team Spirit
+    aliases: [Spirit]
+  - team_id: 9823272
+    name: Team Yandex
+    aliases: [Yandex]
+  - team_id: 726228
+    name: Vici Gaming
+    aliases: [Vici]
+  - team_id: 8261500
+    name: Xtreme Gaming
+    aliases: [Xtreme]

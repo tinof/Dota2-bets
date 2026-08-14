@@ -8,11 +8,15 @@ poll-log. Everything is keyed so that re-running ingestion is idempotent.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from collections.abc import Iterable, Sequence
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path("data/dota2bets.sqlite")
 
@@ -117,6 +121,30 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
 CREATE INDEX IF NOT EXISTS idx_odds_linekey ON odds_snapshots (source, line_key, captured_at);
 CREATE INDEX IF NOT EXISTS idx_odds_event ON odds_snapshots (source, event_id);
 CREATE INDEX IF NOT EXISTS idx_odds_captured ON odds_snapshots (captured_at);
+
+-- Which series each bookmaker event prices (see `aliases.py`). Materialised rather than
+-- a view because the series join is a nearest-start match against a tolerance, and
+-- because it must stay stable once curated: recomputing it per query would let a later
+-- backfill silently move a join that a stored evaluation already depended on.
+CREATE TABLE IF NOT EXISTS event_series_map (
+    source           TEXT    NOT NULL,
+    event_id         TEXT    NOT NULL,
+    units            TEXT,
+    is_kills         INTEGER NOT NULL,
+    parent_event_id  TEXT,
+    home_team_id     INTEGER,
+    away_team_id     INTEGER,
+    series_id        INTEGER,
+    start_skew_s     INTEGER,
+    resolved_at      INTEGER NOT NULL,
+    PRIMARY KEY (source, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_series ON event_series_map (series_id);
+
+CREATE VIEW IF NOT EXISTS v_odds_series AS
+SELECT o.*, e.series_id, e.is_kills, e.parent_event_id, e.home_team_id, e.away_team_id
+FROM odds_snapshots o
+JOIN event_series_map e ON e.source = o.source AND e.event_id = o.event_id;
 """
 
 
@@ -129,6 +157,28 @@ def american_to_decimal(price: float | None) -> float | None:
     if price < 0:
         return 1.0 + 100.0 / abs(price)
     return None
+
+
+def parse_ts(value: str | int | float | None) -> int | None:
+    """Epoch seconds from either representation the database holds.
+
+    Match times are stored as epoch ints (OpenDota), odds times as ISO-8601 text
+    (Pinnacle, sometimes `Z`-suffixed and sometimes `+00:00`), and the two are compared
+    constantly -- cutoffs against map starts, closing lines against kick-off -- so the
+    conversion lives in one place.
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = value.strip()
+    if text.isdigit():
+        return int(text)
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        log.warning("unparseable timestamp %r", value)
+        return None
 
 
 def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:

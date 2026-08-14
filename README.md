@@ -35,6 +35,7 @@ Optional env vars: `OPENDOTA_API_KEY` (raises rate limits), `ODDS_API_KEY` (enab
 | `match_timeseries` | per-minute radiant gold/XP advantage | live model (Phase 3) |
 | `rosters` | player↔team observations over time | roster-stability features |
 | `odds_snapshots` | line history: price, limit, status, market, period | every evaluation |
+| `event_series_map` | which series each bookmaker event prices | every evaluation |
 
 **Sources.** [OpenDota](https://docs.opendota.com/) for matches (free, keyless,
 rate-limited). [Pinnacle's public guest API](src/dota2bets/odds/pinnacle.py) for odds —

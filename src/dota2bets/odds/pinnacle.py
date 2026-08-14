@@ -113,6 +113,11 @@ def normalise(
         league = (matchup.get("league") or {}).get("name")
         period = market.get("period")
         mtype = market.get("type")
+        # team_total quotes one team's total; the team is on the market as `side`,
+        # while the prices only say over/under. Without it both sides of a period
+        # share a line_key at equal points and their prices thrash each other.
+        side = market.get("side")
+        side_team = (home if side == "home" else away) if side in ("home", "away") else None
         limit = next(
             (
                 lim.get("amount")
@@ -141,6 +146,8 @@ def normalise(
                 selection = ordered[idx] if idx < len(ordered) else str(price["participantId"])
             if selection is None:
                 continue
+            if side is not None:
+                selection = f"{side_team or side}:{selection}"
             points = price.get("points")
             # Include points in the key so each alternate line is its own series.
             line_key = "|".join(

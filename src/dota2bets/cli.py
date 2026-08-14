@@ -3,6 +3,7 @@
 dota2bets backfill --max-matches 500     # pro match summaries
 dota2bets detail --limit 100             # drafts, players, per-minute series
 dota2bets record-odds                    # long-running line recorder
+dota2bets resolve                        # join odds events to teams and series
 dota2bets status                         # what is in the database
 """
 
@@ -16,7 +17,7 @@ import time
 from pathlib import Path
 from types import FrameType
 
-from . import archive, storage
+from . import aliases, archive, storage
 from .odds import build_fetchers
 from .opendota import OpenDotaClient, parse_match_detail, parse_match_summary
 
@@ -159,6 +160,26 @@ def cmd_record_odds(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_resolve(args: argparse.Namespace) -> int:
+    """Join recorded odds events to the series they price."""
+    conn = storage.connect(args.db)
+    resolver = aliases.AliasResolver.load(args.aliases)
+    links = aliases.parent_links_from_archive(args.archive_root, args.source)
+    print(f"{len(resolver.teams)} teams in the alias table, {len(links)} parent links archived.")
+    report = aliases.resolve_events(
+        conn,
+        resolver,
+        parent_links=links,
+        source=args.source,
+        tolerance_s=args.tolerance,
+        dry_run=args.dry_run,
+    )
+    print(report.format())
+    if args.dry_run:
+        print("\n(dry run: event_series_map not written)")
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     conn = storage.connect(args.db)
     s = storage.summary(conn)
@@ -212,6 +233,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--once", action="store_true", help="single cycle then exit")
     p.set_defaults(func=cmd_record_odds)
+
+    p = sub.add_parser("resolve", help="map odds events to OpenDota teams and series")
+    p.add_argument("--source", default="pinnacle")
+    p.add_argument("--archive-root", default=str(archive.DEFAULT_ARCHIVE_ROOT))
+    p.add_argument("--aliases", default=None, help="alias table (default: packaged aliases.yaml)")
+    p.add_argument(
+        "--tolerance",
+        type=int,
+        default=aliases.DEFAULT_TOLERANCE_S,
+        help="max seconds between an event's scheduled start and a series' first map",
+    )
+    p.add_argument("--dry-run", action="store_true", help="report only, write nothing")
+    p.set_defaults(func=cmd_resolve)
 
     p = sub.add_parser("status", help="show database contents")
     p.set_defaults(func=cmd_status)
