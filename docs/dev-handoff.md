@@ -1,6 +1,6 @@
 # Dev handoff
 
-State as of 2026-08-14 13:00 local. TI 2026 runs 10–23 Aug, so the odds-capture window
+State as of 2026-08-14 15:00 local. TI 2026 runs 10–23 Aug, so the odds-capture window
 has about nine days left. Read [`research.md`](research.md) for why the project is shaped
 this way; this file is only about where the code stands and what to do next.
 
@@ -286,7 +286,7 @@ matches between established teams. Always state the filter alongside the number.
 ## Commands
 
 ```bash
-uv sync && uv run pytest                        # 70 tests, no network needed
+uv sync && uv run pytest                        # 138 tests, no network needed
 set -a; . ./.env; set +a                          # load OPENDOTA_API_KEY (gitignored)
 uv run dota2bets backfill --max-matches 40000 --resume
 uv run dota2bets detail --limit 5000             # one call per match; watch the quota
