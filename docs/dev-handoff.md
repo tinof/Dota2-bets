@@ -98,10 +98,14 @@ summaries:
   always resumable — it commits per match and re-queries what is missing.
 
 Current state: **64,900 match summaries** (Apr 2024 → now, over two years) and a keyed
-`detail` crawl working through ~62,900 of them at roughly 90 matches/minute, so about
-12 hours wall-clock. It runs under `caffeinate -s` and survives a session ending; check
-progress with `tail -1 data/detail.log`. Note the observed rate is set by API latency,
-not by the delay, so the printed ETA is optimistic.
+`detail` crawl working through ~62,900 of them. Measured throughput is **~75 matches per
+minute — about 14 hours** — with no 429s and no failures. That rate is bound by OpenDota's
+per-request latency (~0.8s), *not* by our delay, so the printed ETA (which assumes the
+delay dominates) is optimistic by an order of magnitude. The key permits 1200 calls/min,
+so a handful of concurrent workers would cut this to ~1.5h; not worth threading a working
+serial pipeline for a one-off overnight crawl, but that is the lever if it is ever needed
+again. It runs under `caffeinate -s` and survives a session ending; check progress with
+`tail -1 data/detail.log`.
 
 **Watch the quota:** the key includes 50,000 calls/month free, then bills per call. One
 detail call per match means this crawl alone exceeds the free allowance by roughly 13,000
@@ -157,7 +161,7 @@ pre-draft evaluation. 92 tests pass.
 
 ## Next steps
 
-1. **Let the detail crawl finish** (~12h from 2026-08-14 15:00 local; resumable — just
+1. **Let the detail crawl finish** (~14h from 2026-08-14 14:30 local; resumable — just
    re-run `dota2bets detail` with the key loaded if it stops). Detail coverage was the
    binding constraint on Phase 1; after this it no longer is.
 2. **Phase 1 ratings** (Glicko-2/Bradley-Terry per patch window + roster stability),
