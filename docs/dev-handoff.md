@@ -159,16 +159,67 @@ Predictions are JSONL of `Prediction` fields (`series_id`, `period`, `selection`
 optional `price_taken`); `--before-draft N` cuts the close N seconds before the horn for
 pre-draft evaluation. 92 tests pass.
 
+### Phase 1 ratings exist, and the TI backtest has a number
+
+`ratings.py` (Glicko-2) and `backtest.py` (walk-forward, tuning, event predictions),
+wired as `dota2bets backtest` and `dota2bets predict`.
+
+**The headline: model Brier 0.2993 vs closing Brier 0.2508 on the same 70 TI rows.** The
+model does not beat the market. That was the expected result for team strength alone, and
+it is the number every later model has to improve on. Separately, over all 55 played TI
+maps (including 10–12 Aug, which the recorder missed entirely) it scores Brier 0.2337
+against a 0.25 coin flip.
+
+**Glicko-2, not Bradley-Terry.** The binding constraint is leak-freeness, not fit quality:
+an online update yields a strictly pre-match prediction for all 62k historical maps in one
+pass, where a time-decayed BT must be refit at every prediction point. RD inflation over
+idle time *is* the decay, so there is no separate half-life. Per-patch training was
+impossible anyway — `matches.patch` is NULL on every summary-only row.
+
+**Most of the match pool is unpredictable, and it was hiding the model.** OpenDota's
+`/proMatches` is dominated by low-tier grinder circuits — Destiny League alone is 7,645 of
+62,000 matches — and an unfiltered walk-forward reads Brier 0.2449, a 1.3% edge on a coin
+flip. A plain Elo baseline scored the same 2%, which is what ruled out an implementation
+bug rather than a data problem. Restricted to top-tier leagues between teams with 20+
+prior maps, the *same ratings* score 0.2266, a 9.4% edge.
+
+Those tier-3 maps still **train** the book — training on elite-only is measurably worse,
+because teams cross between circuits — they are simply not the population to be judged on.
+So `--score elite` (the default) narrows the metric only, never the training set. Read any
+unfiltered Brier on this dataset as meaningless.
+
+The tuning grid is flat to the fourth decimal across `tau` and idle period, so Glickman's
+defaults stand instead of a fitted value that would really be noise. Don't spend more time
+tuning these; the gains are in features, not constants.
+
+Also fixed: `evaluation.WINS_NEEDED` let `series_type=3` (best-of-two) fall through to
+first-to-1, crowning the map-1 winner of a series that can end 1-1 and never settles. 2,676
+such matches exist in the DB. Not triggered at TI, where every series is a Bo3.
+
+Predictions land in gitignored `data/`, so they are never committed:
+
+```bash
+uv run dota2bets backtest --tune          # grid search on the elite subset
+uv run dota2bets predict --out data/ti2026_preds.jsonl
+uv run dota2bets eval --predictions data/ti2026_preds.jsonl
+```
+
 ## Next steps
 
 1. **Let the detail crawl finish** (~14h from 2026-08-14 14:30 local; resumable — just
    re-run `dota2bets detail` with the key loaded if it stops). Detail coverage was the
    binding constraint on Phase 1; after this it no longer is.
-2. **Phase 1 ratings** (Glicko-2/Bradley-Terry per patch window + roster stability),
-   scored through `dota2bets eval` from day one. The bar is `closing_brier`, printed
-   next to the model's on the same rows.
-3. Re-run `dota2bets resolve` and `window_report.py` as TI progresses; both are
-   idempotent and cheap.
+2. **Phase 1b, once detail lands**: per-patch rating windows and a roster-stability
+   penalty (both need `match_players`, hence the crawl). Add them as *features on top of*
+   the Glicko baseline and re-run the same two commands — the 0.2266 elite Brier and the
+   0.2993 TI Brier are the numbers to beat, and any change that does not move both is not
+   an improvement.
+3. **The gap to close is 0.05 Brier, and ratings alone will not close it.** The market
+   prices roster news, patch reads and draft; the model prices none of them. The draft
+   model (Phase 2) is the one with a real shot, and `window_report.py` already proved
+   map-2/3 moneylines stay open through their drafts at $2,500 median max stake.
+4. Re-run `dota2bets resolve`, `predict` and `window_report.py` as TI progresses; all are
+   idempotent and cheap. Each finished series adds rows to the CLV comparison.
 
 ## Gotchas worth not rediscovering
 
@@ -224,7 +275,13 @@ composition predicts kill volume more directly than it predicts the winner); not
 reorganising around.
 
 **Avoid tier-3 matches** — softest markets, but match-fixing risk makes that softness
-adverse selection rather than edge.
+adverse selection rather than edge. They are also 79% of the match table and close to
+coin flips, so any metric averaged over the whole pool is measuring their noise; see the
+Phase 1 section on `--score elite`.
+
+**A model result on this data is not interpretable without saying which population it was
+scored on.** Same ratings, same code: 0.2449 Brier over everything, 0.2266 over top-tier
+matches between established teams. Always state the filter alongside the number.
 
 ## Commands
 
@@ -237,6 +294,8 @@ uv run dota2bets resolve                         # join odds events to teams/ser
 uv run dota2bets record-odds --once              # single cycle, for debugging
 uv run dota2bets eval                            # closing de-vigged probs per series
 uv run dota2bets eval --predictions preds.jsonl  # CLV + Brier vs the closing Brier
+uv run dota2bets backtest --tune                 # walk-forward grid search (elite subset)
+uv run dota2bets predict --out data/preds.jsonl  # pre-match predictions for TI
 uv run dota2bets status
 uv run python scripts/window_report.py           # the draft-window experiment
 ```
