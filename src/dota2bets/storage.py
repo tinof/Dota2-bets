@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import time
 from collections.abc import Iterable, Sequence
@@ -179,6 +180,17 @@ def parse_ts(value: str | int | float | None) -> int | None:
     except ValueError:
         log.warning("unparseable timestamp %r", value)
         return None
+
+
+def connect_ro(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    """Open the live database without disturbing the recorder.
+
+    Never copy the .sqlite file to read it: in WAL mode the recent commits live in the
+    -wal sidecar and a plain copy reads stale.
+    """
+    conn = sqlite3.connect(f"file:{os.path.abspath(str(db_path))}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def connect(db_path: Path | str = DEFAULT_DB_PATH) -> sqlite3.Connection:

@@ -22,7 +22,6 @@ Reads the database read-only, so it is safe to run while the recorder is polling
 from __future__ import annotations
 
 import argparse
-import os
 import sqlite3
 import statistics
 import sys
@@ -33,7 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from dota2bets.intervals import Interval, coverage, gaps, merge, open_intervals  # noqa: E402
-from dota2bets.storage import DEFAULT_DB_PATH, parse_ts  # noqa: E402
+from dota2bets.storage import DEFAULT_DB_PATH, connect_ro, parse_ts  # noqa: E402
 
 BIDDABLE_THRESHOLD = 0.9
 
@@ -53,17 +52,6 @@ class PeriodRow:
     last_prices: dict[str, float]
     last_limit: float | None
     observed: bool = True
-
-
-def connect_ro(db_path: str) -> sqlite3.Connection:
-    """Open the live database without disturbing the recorder.
-
-    Never copy the .sqlite file to read it: in WAL mode the recent commits live in the
-    -wal sidecar and a plain copy reads stale.
-    """
-    conn = sqlite3.connect(f"file:{os.path.abspath(db_path)}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
 def series_maps(conn: sqlite3.Connection, series_id: int) -> list[sqlite3.Row]:

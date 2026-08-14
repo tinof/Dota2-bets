@@ -91,17 +91,47 @@ zero new code on an already-tested pipeline). The keyless tier is fine for keepi
 with TI day to day, but a year-scale backfill would consume most of a month's quota.
 Switch to STRATZ only if the key's pricing disappoints at signup.
 
+### The evaluation harness exists (`evaluation.py` + `dota2bets eval`)
+
+Every future model is graded against the closing market from its first prediction — CLV
+and Brier *against the closing probability on the same rows*, never raw accuracy.
+
+`devig_proportional` / `devig_shin` (+ `shin_z`) remove the vig; Shin is the default
+because books load the longshot and proportional de-vig pretends they don't. Reference
+values are pinned in tests, including the favourite-longshot direction check.
+
+The closing line is the part that is easy to get silently wrong, so:
+
+* **The bound is `matches.start_time` (OpenDota's horn), never `cutoff_at` and never
+  Pinnacle's `start_time`.** The earlier design said "before min(cutoff, start)"; that is
+  wrong under the placeholder gotcha below — the min is a no-op while the cutoff is parked
+  far-future, and a *genuine* cutoff flips rows to `status='closed'`, which the open filter
+  already drops. `cutoff_at` survives only as a `stale_cutoff` warning flag.
+* **Only the parentless event is the pre-match one** (`closing_event`), plus an `is_live=0`
+  predicate in `closing_lines`. Both filters are independent, so an archive gap that hides
+  a parent link degrades to "no closing line", never to a live price masquerading as a close.
+* Totals de-vig **per `points` group** — alternate lines are separate two-sided books, and
+  pooling them would produce nonsense probabilities.
+
+Live output, cross-checked against `window_report` on series 1130278 (identical prices):
+
+```
+1130278 p1  vig +0.049  Spirit 0.566 @1.69  Aurora 0.434 @2.18
+```
+
+Predictions are JSONL of `Prediction` fields (`series_id`, `period`, `selection`, `prob`,
+optional `price_taken`); `--before-draft N` cuts the close N seconds before the horn for
+pre-draft evaluation. 92 tests pass.
+
 ## Next steps
 
-1. **Evaluation harness before any model.** De-vig (proportional + Shin) and CLV joining
-   model probabilities to the last pre-cutoff snapshot from the *pre-match* event, never
-   the live child. Sketch in the approved plan at
-   `~/.claude/plans/regarding-the-docs-dev-handoff-md-how-linked-squirrel.md`.
-2. **Finish the backfill** once the key decision is made. Detail coverage is the binding
-   constraint on Phase 1 — training data is still effectively absent.
-3. **Phase 1 ratings** (Glicko-2/Bradley-Terry per patch window + roster stability),
-   scored against the harness from day one — never raw accuracy.
-4. Re-run `dota2bets resolve` and `window_report.py` as TI progresses; both are
+1. **Finish the backfill.** Summaries expanding to ~18 months now; detail coverage is
+   still the binding constraint on Phase 1. Decide the OpenDota key (see sourcing note
+   above) — keyless works but a year-scale detail crawl is ~20 days.
+2. **Phase 1 ratings** (Glicko-2/Bradley-Terry per patch window + roster stability),
+   scored through `dota2bets eval` from day one. The bar is `closing_brier`, printed
+   next to the model's on the same rows.
+3. Re-run `dota2bets resolve` and `window_report.py` as TI progresses; both are
    idempotent and cheap.
 
 ## Gotchas worth not rediscovering
@@ -124,6 +154,9 @@ python pair.
 far-future cutoff (hours out, sometimes days) on a period whose map has not been reached,
 then pulls it in as the map approaches. Only cutoffs published while the market is still
 ahead of its map mean anything; `window_report` ignores the rest.
+
+**Read paths use `storage.connect_ro`** (moved out of `window_report.py`, which now imports
+it). `dota2bets eval` opens the DB read-only, so it is safe while the recorder polls.
 
 **`status='closed'` is not the same as a tombstone.** `gone` means the line vanished from
 the poll; `closed` means Pinnacle still lists it but is not taking bets. Both are
@@ -165,6 +198,8 @@ uv run dota2bets backfill --max-matches 2000
 uv run dota2bets detail --limit 2000             # slow; see rate limits
 uv run dota2bets resolve                         # join odds events to teams/series
 uv run dota2bets record-odds --once              # single cycle, for debugging
+uv run dota2bets eval                            # closing de-vigged probs per series
+uv run dota2bets eval --predictions preds.jsonl  # CLV + Brier vs the closing Brier
 uv run dota2bets status
 uv run python scripts/window_report.py           # the draft-window experiment
 ```

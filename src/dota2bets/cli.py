@@ -4,6 +4,7 @@ dota2bets backfill --max-matches 500     # pro match summaries
 dota2bets detail --limit 100             # drafts, players, per-minute series
 dota2bets record-odds                    # long-running line recorder
 dota2bets resolve                        # join odds events to teams and series
+dota2bets eval                           # closing lines, de-vig, CLV/Brier
 dota2bets status                         # what is in the database
 """
 
@@ -17,7 +18,7 @@ import time
 from pathlib import Path
 from types import FrameType
 
-from . import aliases, archive, storage
+from . import aliases, archive, evaluation, storage
 from .odds import build_fetchers
 from .opendota import OpenDotaClient, parse_match_detail, parse_match_summary
 
@@ -202,6 +203,90 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_eval(args: argparse.Namespace) -> int:
+    """Closing lines and, given predictions, the CLV and Brier they earned."""
+    conn = storage.connect_ro(args.db)
+    resolver = aliases.AliasResolver.load(args.aliases)
+
+    if not args.predictions:
+        series = [
+            r[0]
+            for r in conn.execute(
+                "SELECT DISTINCT series_id FROM event_series_map "
+                "WHERE source = ? AND series_id IS NOT NULL ORDER BY series_id",
+                (args.source,),
+            )
+        ]
+        print(f"{len(series)} resolved series; closing {args.market} probs ({args.method} de-vig)")
+        shown = 0
+        for series_id in series:
+            for period in (0, 1, 2, 3):
+                line = evaluation.closing_probs(
+                    conn,
+                    args.source,
+                    series_id,
+                    period,
+                    market_type=args.market,
+                    method=args.method,
+                    before=None,
+                )
+                if line is None:
+                    continue
+                shown += 1
+                probs = "  ".join(
+                    f"{name} {p:.3f} @{line.prices[name]:.2f}"
+                    for name, p in sorted(line.selections.items(), key=lambda kv: -kv[1])
+                )
+                flag = "  [stale cutoff]" if line.stale_cutoff else ""
+                print(
+                    f"  {series_id} p{period}  vig {line.overround - 1:+.3f}  {probs}"
+                    f"  ({time.strftime('%m-%d %H:%M', time.localtime(line.captured_at))}){flag}"
+                )
+        if not shown:
+            print("  no closing lines yet (needs a played map and a resolved event)")
+        return 0
+
+    predictions = evaluation.load_predictions(args.predictions)
+    report = evaluation.clv_report(
+        conn,
+        predictions,
+        source=args.source,
+        method=args.method,
+        resolver=resolver,
+        before_draft_s=args.before_draft,
+    )
+    if report.rows:
+        header = (
+            f"{'series':>9} {'p':>2} {'selection':<16} {'model':>6} "
+            f"{'close':>6} {'edge':>7} {'CLV':>7} {'win':>3}"
+        )
+        print(header)
+        print("-" * len(header))
+        for r in report.rows:
+            clv = f"{r.clv:+.3f}" if r.clv is not None else "     -"
+            print(
+                f"{r.prediction.series_id:>9} {r.prediction.period:>2} "
+                f"{r.prediction.selection:<16} {r.prediction.prob:>6.3f} "
+                f"{r.closing_prob:>6.3f} {r.edge_at_close:>+7.3f} {clv:>7} "
+                f"{r.outcome:>3}"
+            )
+    print(f"\nscored {report.n_scored} of {report.n_scored + len(report.skipped)} predictions")
+    if report.n_scored:
+        print(f"  model Brier      {report.model_brier:.4f}")
+        print(f"  closing Brier    {report.closing_brier:.4f}   <- the bar to beat")
+        print(f"  mean edge close  {report.mean_edge_at_close:+.4f}")
+        if report.mean_clv is not None:
+            print(f"  mean CLV         {report.mean_clv:+.4f}")
+    if report.skipped:
+        print("\nskipped:")
+        counts: dict[str, int] = {}
+        for _, reason in report.skipped:
+            counts[reason] = counts.get(reason, 0) + 1
+        for reason, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+            print(f"  {n:>4}  {reason}")
+    return 0 if report.n_scored else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dota2bets", description=__doc__)
     parser.add_argument("--db", default=str(storage.DEFAULT_DB_PATH), help="SQLite path")
@@ -246,6 +331,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dry-run", action="store_true", help="report only, write nothing")
     p.set_defaults(func=cmd_resolve)
+
+    p = sub.add_parser("eval", help="closing lines, de-vig, and CLV/Brier for predictions")
+    p.add_argument("--predictions", default=None, help="JSONL of model predictions")
+    p.add_argument("--source", default="pinnacle")
+    p.add_argument("--market", default="moneyline")
+    p.add_argument("--method", choices=["shin", "proportional"], default="shin")
+    p.add_argument("--aliases", default=None, help="alias table (default: packaged aliases.yaml)")
+    p.add_argument(
+        "--before-draft",
+        type=int,
+        default=None,
+        help="seconds before a map's horn to cut the closing line at (pre-draft evaluation)",
+    )
+    p.set_defaults(func=cmd_eval)
 
     p = sub.add_parser("status", help="show database contents")
     p.set_defaults(func=cmd_status)
