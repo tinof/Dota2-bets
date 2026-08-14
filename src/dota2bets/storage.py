@@ -385,6 +385,12 @@ def write_tombstones(
     return written
 
 
+def oldest_match_id(conn: sqlite3.Connection) -> int | None:
+    """Lowest stored match id -- the resume cursor for a backwards summary crawl."""
+    row = conn.execute("SELECT MIN(match_id) FROM matches").fetchone()
+    return int(row[0]) if row and row[0] is not None else None
+
+
 def matches_needing_detail(conn: sqlite3.Connection, limit: int = 100) -> list[int]:
     """Match ids whose summary is stored but whose draft/timeseries detail is not."""
     rows = conn.execute(

@@ -37,9 +37,15 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     """Page through /proMatches and store match summaries."""
     conn = storage.connect(args.db)
     stored = 0
-    with OpenDotaClient() as client:
+    cursor = args.before_match_id
+    if cursor is None and args.resume:
+        cursor = storage.oldest_match_id(conn)
+        print(
+            f"Resuming below match {cursor}." if cursor else "Nothing stored yet; starting fresh."
+        )
+    with OpenDotaClient(delay_s=args.delay) as client:
         batch = []
-        for m in client.iter_pro_matches(max_matches=args.max_matches):
+        for m in client.iter_pro_matches(max_matches=args.max_matches, before_match_id=cursor):
             if args.league_id and m.get("leagueid") != args.league_id:
                 continue
             batch.append(parse_match_summary(m))
@@ -62,9 +68,10 @@ def cmd_detail(args: argparse.Namespace) -> int:
     if not match_ids:
         print("No matches awaiting detail. Run `backfill` first.")
         return 0
-    print(f"Fetching detail for {len(match_ids)} matches (~{args.limit * 1.2:.0f}s)...")
     ok = failed = 0
-    with OpenDotaClient() as client:
+    with OpenDotaClient(delay_s=args.delay) as client:
+        eta = len(match_ids) * client.delay_s
+        print(f"Fetching detail for {len(match_ids)} matches (~{eta:.0f}s)...")
         for i, match_id in enumerate(match_ids, 1):
             if _stop:
                 break
@@ -296,10 +303,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("backfill", help="store pro match summaries from OpenDota")
     p.add_argument("--max-matches", type=int, default=500)
     p.add_argument("--league-id", type=int, default=None, help="restrict to one league")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help="continue below the oldest stored match instead of re-walking from newest",
+    )
+    p.add_argument("--before-match-id", type=int, default=None, help="explicit paging cursor")
+    p.add_argument("--delay", type=float, default=None, help="seconds between calls")
     p.set_defaults(func=cmd_backfill)
 
     p = sub.add_parser("detail", help="fetch drafts/players/series for stored matches")
     p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--delay", type=float, default=None, help="seconds between calls")
     p.set_defaults(func=cmd_detail)
 
     p = sub.add_parser("record-odds", help="poll odds sources and record line movements")

@@ -65,3 +65,64 @@ def test_rosters_link_players_to_their_own_team(match_detail):
         pl["account_id"] for pl in p["players"] if pl["is_radiant"] and pl["account_id"]
     }
     assert radiant == radiant_players
+
+def test_rate_limit_backoff_is_exponential_and_honours_retry_after(monkeypatch):
+    """A sustained throttle must not end a long crawl after a few seconds of waiting."""
+    from dota2bets import opendota
+
+    slept: list[float] = []
+    monkeypatch.setattr(opendota.time, "sleep", slept.append)
+    client = opendota.OpenDotaClient(api_key=None, delay_s=0)
+    calls = {"n": 0}
+
+    class Resp:
+        def __init__(self, code, headers=None):
+            self.status_code = code
+            self.headers = headers or {}
+
+        def json(self):
+            return {"ok": True}
+
+        def raise_for_status(self):
+            return None
+
+    def fake_get(path, params=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return Resp(429)
+        if calls["n"] == 2:
+            return Resp(429, {"Retry-After": "90"})
+        return Resp(200)
+
+    monkeypatch.setattr(client._client, "get", fake_get)
+    assert client.get("/proMatches") == {"ok": True}
+    assert slept[0] == opendota.BACKOFF_BASE_S
+    # Retry-After wins when it asks for longer than the doubling schedule would wait.
+    assert slept[1] == 90
+
+
+def test_keyed_client_uses_the_faster_delay():
+    from dota2bets.opendota import KEYED_DELAY_S, OpenDotaClient
+
+    assert OpenDotaClient(api_key="k").delay_s == KEYED_DELAY_S
+    assert OpenDotaClient(api_key="k", delay_s=2.0).delay_s == 2.0
+
+
+def test_iter_pro_matches_resumes_below_a_cursor(monkeypatch):
+    """Restarting a crawl must continue past what is stored, not re-walk it."""
+    from dota2bets.opendota import OpenDotaClient
+
+    client = OpenDotaClient(api_key=None, delay_s=0)
+    seen_cursors: list[int | None] = []
+
+    def fake_pro_matches(less_than_match_id=None):
+        seen_cursors.append(less_than_match_id)
+        if less_than_match_id is None or less_than_match_id > 200:
+            base = less_than_match_id or 300
+            return [{"match_id": base - 1}, {"match_id": base - 2}]
+        return []
+
+    monkeypatch.setattr(client, "pro_matches", fake_pro_matches)
+    ids = [m["match_id"] for m in client.iter_pro_matches(max_matches=4, before_match_id=250)]
+    assert seen_cursors[0] == 250
+    assert ids == [249, 248, 247, 246]

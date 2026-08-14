@@ -20,6 +20,11 @@ log = logging.getLogger(__name__)
 BASE_URL = "https://api.opendota.com/api"
 # Free tier allows 60 calls/minute; stay comfortably under it.
 DEFAULT_DELAY_S = 1.2
+# A key raises the ceiling to 1200/min, so a keyed crawl need not creep.
+KEYED_DELAY_S = 0.12
+MAX_ATTEMPTS = 7
+BACKOFF_BASE_S = 5
+BACKOFF_CAP_S = 300
 
 
 class OpenDotaClient:
@@ -28,10 +33,12 @@ class OpenDotaClient:
     def __init__(
         self,
         api_key: str | None = None,
-        delay_s: float = DEFAULT_DELAY_S,
+        delay_s: float | None = None,
         timeout: float = 30.0,
     ) -> None:
         self.api_key = api_key or os.environ.get("OPENDOTA_API_KEY")
+        if delay_s is None:
+            delay_s = KEYED_DELAY_S if self.api_key else DEFAULT_DELAY_S
         self.delay_s = delay_s
         self._client = httpx.Client(
             base_url=BASE_URL, timeout=timeout, headers={"User-Agent": "dota2bets/0.1"}
@@ -56,12 +63,22 @@ class OpenDotaClient:
     def get(self, path: str, **params: Any) -> Any:
         if self.api_key:
             params["api_key"] = self.api_key
-        for attempt in range(4):
+        for attempt in range(MAX_ATTEMPTS):
             self._throttle()
             resp = self._client.get(path, params=params)
             if resp.status_code == 429:
-                wait = 5 * (attempt + 1)
-                log.warning("OpenDota rate limited; sleeping %ss", wait)
+                # A sustained throttle outlasts a linear backoff: a long crawl that
+                # raises here has to restart, so back off far enough to ride it out.
+                wait = min(BACKOFF_CAP_S, BACKOFF_BASE_S * 2**attempt)
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    wait = max(wait, int(retry_after))
+                log.warning(
+                    "OpenDota rate limited (attempt %d/%d); sleeping %ss",
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    wait,
+                )
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
@@ -75,10 +92,16 @@ class OpenDotaClient:
             params["less_than_match_id"] = less_than_match_id
         return self.get("/proMatches", **params)
 
-    def iter_pro_matches(self, max_matches: int = 500) -> Iterator[dict[str, Any]]:
-        """Page backwards through pro matches until `max_matches` are yielded."""
+    def iter_pro_matches(
+        self, max_matches: int = 500, before_match_id: int | None = None
+    ) -> Iterator[dict[str, Any]]:
+        """Page backwards through pro matches until `max_matches` are yielded.
+
+        `before_match_id` resumes an interrupted crawl from where it stopped instead of
+        re-walking the pages already stored.
+        """
         seen = 0
-        cursor: int | None = None
+        cursor: int | None = before_match_id
         while seen < max_matches:
             page = self.pro_matches(less_than_match_id=cursor)
             if not page:
