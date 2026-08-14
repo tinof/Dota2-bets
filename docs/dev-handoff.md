@@ -75,7 +75,39 @@ So the Phase 2 draft model has a real window to bet into, and the retarget towar
 live-anchored betting is **not** needed. That was the open strategic question; it is
 closed for now, on nine series of TI data. Re-run the report as more series finish.
 
-### History backfill
+### History backfill: keyed, resumable, and running
+
+**An OpenDota API key is now in use.** It lives in `.env` (gitignored) as
+`OPENDOTA_API_KEY` — never commit it, and load it per-shell:
+
+```bash
+set -a; . ./.env; set +a
+```
+
+With a key the client paces itself at 0.12s instead of the keyless 1.2s, and the
+40,000-summary crawl that previously took hours (and died) finished in about 90 seconds.
+
+Two fixes made the crawl completable, both prompted by a real 429 crash at ~24,900
+summaries:
+
+* **Backoff doubles to five minutes and honours `Retry-After`.** The old linear 5/10/15s
+  schedule gave up after 30 seconds, which a sustained throttle simply outlasts — and the
+  exception killed a crawl that had no way to resume.
+* **`backfill --resume`** continues below the oldest stored `match_id`
+  (`storage.oldest_match_id`) instead of re-walking from the newest match. `detail` was
+  always resumable — it commits per match and re-queries what is missing.
+
+Current state: **64,900 match summaries** (Apr 2024 → now, over two years) and a keyed
+`detail` crawl working through ~62,900 of them at roughly 90 matches/minute, so about
+12 hours wall-clock. It runs under `caffeinate -s` and survives a session ending; check
+progress with `tail -1 data/detail.log`. Note the observed rate is set by API latency,
+not by the delay, so the printed ETA is optimistic.
+
+**Watch the quota:** the key includes 50,000 calls/month free, then bills per call. One
+detail call per match means this crawl alone exceeds the free allowance by roughly 13,000
+calls (about $1–2). Cheap, but not free — don't loop it needlessly.
+
+### Earlier sourcing note (superseded by the key above)
 
 2,000 pro-match summaries ingested; a detail crawl (drafts, players, per-minute series)
 is running in the background against the keyless API at ~1 match/second.
@@ -125,9 +157,9 @@ pre-draft evaluation. 92 tests pass.
 
 ## Next steps
 
-1. **Finish the backfill.** Summaries expanding to ~18 months now; detail coverage is
-   still the binding constraint on Phase 1. Decide the OpenDota key (see sourcing note
-   above) — keyless works but a year-scale detail crawl is ~20 days.
+1. **Let the detail crawl finish** (~12h from 2026-08-14 15:00 local; resumable — just
+   re-run `dota2bets detail` with the key loaded if it stops). Detail coverage was the
+   binding constraint on Phase 1; after this it no longer is.
 2. **Phase 1 ratings** (Glicko-2/Bradley-Terry per patch window + roster stability),
    scored through `dota2bets eval` from day one. The bar is `closing_brier`, printed
    next to the model's on the same rows.
@@ -194,8 +226,9 @@ adverse selection rather than edge.
 
 ```bash
 uv sync && uv run pytest                        # 70 tests, no network needed
-uv run dota2bets backfill --max-matches 2000
-uv run dota2bets detail --limit 2000             # slow; see rate limits
+set -a; . ./.env; set +a                          # load OPENDOTA_API_KEY (gitignored)
+uv run dota2bets backfill --max-matches 40000 --resume
+uv run dota2bets detail --limit 5000             # one call per match; watch the quota
 uv run dota2bets resolve                         # join odds events to teams/series
 uv run dota2bets record-odds --once              # single cycle, for debugging
 uv run dota2bets eval                            # closing de-vigged probs per series
@@ -204,7 +237,7 @@ uv run dota2bets status
 uv run python scripts/window_report.py           # the draft-window experiment
 ```
 
-Env: `OPENDOTA_API_KEY` (paid tier), `ODDS_API_KEY` (enables `--sources pinnacle
+Env: `OPENDOTA_API_KEY` (set, in gitignored `.env`), `ODDS_API_KEY` (enables `--sources pinnacle
 theoddsapi`; still never run against the real API).
 
 ## Settled questions
