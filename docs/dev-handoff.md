@@ -409,5 +409,6 @@ theoddsapi`; still never run against the real API).
 
 ## Settled questions
 
-`papers/thesis.pdf` (a 2006 Waikato MSc thesis on multi-instance learning) is deliberate
-background reading for the multi-instance-learning esports paper, not a misplaced file.
+`papers/thesis.pdf` (a 2006 Waikato MSc thesis on multi-instance learning) has been
+removed — it was background reading for the multi-instance-learning esports paper, not a
+Dota 2 document, and is not needed in the repo.

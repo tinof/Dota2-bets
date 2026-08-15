@@ -87,6 +87,4 @@ uv run ruff check .
 
 ## Papers
 
-`papers/` holds the reference PDFs. Note that `papers/thesis.pdf` is *not* a Dota 2
-document — it is a 2006 Waikato MSc thesis on multi-instance learning algorithms, likely
-downloaded as background for the multi-instance-learning esports paper.
+`papers/` holds the reference PDFs cited in [`docs/research.md`](docs/research.md).
