@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import pytest
 
@@ -11,6 +12,7 @@ from dota2bets.ratings import (
     RatingBook,
     TeamState,
     _rate,
+    load_lineups,
     rating_rows,
     replay,
     series_win_prob,
@@ -63,6 +65,33 @@ def test_glickman_worked_example():
     assert result.rating == pytest.approx(1464.06, abs=0.05)
     assert result.rd == pytest.approx(151.52, abs=0.05)
     assert result.sigma == pytest.approx(0.05999, abs=1e-5)
+
+
+def test_default_config_has_no_boosts():
+    cfg = Glicko2Config()
+    assert cfg.patch_rd_boost is None
+    assert cfg.roster_rd_boost is None
+
+
+def test_rate_preserves_state_fields():
+    state = TeamState(
+        mu=0.0,
+        phi=1.0,
+        sigma=0.06,
+        last_played=1234,
+        games=5,
+        last_patch=59,
+        lineup=frozenset({1, 2, 3, 4, 5}),
+    )
+    rated = _rate(
+        state,
+        [(_internal(1500.0, 200.0).mu, _internal(1500.0, 200.0).phi, 1.0)],
+        tau=0.5,
+    )
+    assert rated.last_played == 1234
+    assert rated.games == 6
+    assert rated.last_patch == 59
+    assert rated.lineup == frozenset({1, 2, 3, 4, 5})
 
 
 def test_win_prob_is_symmetric_and_ordered():
@@ -202,3 +231,258 @@ def test_ratings_stay_finite_over_a_long_streak(conn):
     book = replay(conn)
     assert math.isfinite(book.state(SPIRIT).rating)
     assert 0.0 < book.win_prob(SPIRIT, AURORA, at=300 * DAY) < 1.0
+
+
+# ----------------------------------------------------------------- patch transitions
+
+
+def test_patch_transition_prices_closer_to_half_and_subsequent_maps_unwidened():
+    config = Glicko2Config(patch_rd_boost=60.0)
+    book = RatingBook(config)
+    book.states[SPIRIT] = _internal(1700.0, 50.0)
+    book.states[SPIRIT].last_patch = 59
+    book.states[AURORA] = _internal(1400.0, 50.0)
+    book.states[AURORA].last_patch = 59
+
+    # Baseline on same patch
+    p_same = book.win_prob(SPIRIT, AURORA, at=0, patch=59)
+    assert p_same > 0.5
+
+    # First map on newer patch 60
+    p_new = book.win_prob(SPIRIT, AURORA, at=0, patch=60)
+    assert 0.5 < p_new < p_same
+
+    # Play map on patch 60
+    book.update_map(0, SPIRIT, AURORA, patch=60)
+    assert book.state(SPIRIT).last_patch == 60
+    assert book.state(AURORA).last_patch == 60
+
+    # Second map on patch 60 gets no further widening
+    inf_second = book._inflated(SPIRIT, 0, patch=60)
+    inf_unpatched = book._inflated(SPIRIT, 0, patch=None)
+    assert inf_second.rd == pytest.approx(inf_unpatched.rd)
+
+
+def test_first_seen_patch_and_older_patch_do_not_widen():
+    config = Glicko2Config(patch_rd_boost=60.0)
+    book = RatingBook(config)
+    book.states[SPIRIT] = _internal(1700.0, 50.0)
+    book.states[AURORA] = _internal(1400.0, 50.0)
+
+    # First seen patch (last_patch is None)
+    inf_first = book._inflated(SPIRIT, 0, patch=60)
+    assert inf_first.rd == pytest.approx(50.0)
+
+    # Set last_patch to 60
+    book.states[SPIRIT].last_patch = 60
+    # Older patch (59 < 60)
+    inf_older = book._inflated(SPIRIT, 0, patch=59)
+    assert inf_older.rd == pytest.approx(50.0)
+
+
+def test_null_patch_does_not_trigger_or_clear_last_patch():
+    config = Glicko2Config(patch_rd_boost=60.0)
+    book = RatingBook(config)
+    book.states[SPIRIT] = _internal(1700.0, 50.0)
+    book.states[AURORA] = _internal(1400.0, 50.0)
+
+    # Set initial patch to 59
+    book.update_map(0, SPIRIT, AURORA, patch=59)
+    assert book.state(SPIRIT).last_patch == 59
+
+    # 59 -> NULL map: does not clear last_patch
+    book.update_map(10, SPIRIT, AURORA, patch=None)
+    assert book.state(SPIRIT).last_patch == 59
+
+    # NULL -> 59: same patch, does not fire
+    inf_59 = book._inflated(SPIRIT, 20, patch=59)
+    inf_none = book._inflated(SPIRIT, 20, patch=None)
+    assert inf_59.rd == pytest.approx(inf_none.rd)
+
+    # 59 -> 60: fires boost
+    inf_60 = book._inflated(SPIRIT, 20, patch=60)
+    assert inf_60.rd > inf_none.rd
+
+
+def test_stale_older_patch_does_not_rearm_the_transition_boost():
+    config = Glicko2Config(patch_rd_boost=60.0)
+    book = RatingBook(config)
+    book.states[SPIRIT] = _internal(1700.0, 50.0)
+    book.states[AURORA] = _internal(1400.0, 50.0)
+
+    book.update_map(0, SPIRIT, AURORA, patch=60)
+    # A stale row carrying an older patch must not roll the tracker back to 59...
+    book.update_map(10, SPIRIT, AURORA, patch=59)
+    assert book.state(SPIRIT).last_patch == 60
+
+    # ...or the next map on 60 would fire the boost a second time.
+    inf_60 = book._inflated(SPIRIT, 20, patch=60)
+    assert inf_60.rd == pytest.approx(book.state(SPIRIT).rd)
+
+
+def test_patch_disabled_is_bit_identical_to_baseline(conn):
+    rows = [
+        _match(1, 1 * HOUR, 1, patch=58),
+        _match(2, 2 * HOUR, 1, patch=59),
+        _match(3, 3 * HOUR, 0, patch=60),
+    ]
+    storage.upsert_matches(conn, rows)
+
+    book_default = replay(conn, Glicko2Config())
+    book_boost = replay(conn, Glicko2Config(patch_rd_boost=None))
+
+    assert book_default.state(SPIRIT).mu == book_boost.state(SPIRIT).mu
+    assert book_default.state(SPIRIT).phi == book_boost.state(SPIRIT).phi
+    assert book_default.state(AURORA).mu == book_boost.state(AURORA).mu
+    assert book_default.state(AURORA).phi == book_boost.state(AURORA).phi
+
+
+# ----------------------------------------------------------------- roster stability
+
+
+def test_roster_widening_is_monotone_in_substitutions_and_zero_for_unchanged():
+    config = Glicko2Config(roster_rd_boost=30.0)
+    book = RatingBook(config)
+    book.states[SPIRIT] = _internal(1700.0, 50.0)
+    book.states[SPIRIT].lineup = frozenset({1, 2, 3, 4, 5})
+    book.states[AURORA] = _internal(1400.0, 50.0)
+    book.states[AURORA].lineup = frozenset({11, 12, 13, 14, 15})
+
+    lineup_0 = {SPIRIT: frozenset({1, 2, 3, 4, 5}), AURORA: frozenset({11, 12, 13, 14, 15})}
+    lineup_1 = {SPIRIT: frozenset({1, 2, 3, 4, 99}), AURORA: frozenset({11, 12, 13, 14, 15})}
+    lineup_3 = {SPIRIT: frozenset({1, 2, 97, 98, 99}), AURORA: frozenset({11, 12, 13, 14, 15})}
+
+    p0 = book.win_prob(SPIRIT, AURORA, at=0, lineups=lineup_0)
+    p1 = book.win_prob(SPIRIT, AURORA, at=0, lineups=lineup_1)
+    p3 = book.win_prob(SPIRIT, AURORA, at=0, lineups=lineup_3)
+
+    assert p0 > p1 > p3 > 0.5
+    assert book._inflated(SPIRIT, 0, lineup=frozenset({1, 2, 3, 4, 5})).rd == pytest.approx(50.0)
+
+
+def test_null_lineup_does_not_adjust_or_erase_stored_lineup():
+    config = Glicko2Config(roster_rd_boost=30.0)
+    book = RatingBook(config)
+    book.states[SPIRIT] = _internal(1700.0, 50.0)
+    book.states[SPIRIT].lineup = frozenset({1, 2, 3, 4, 5})
+    book.states[AURORA] = _internal(1400.0, 50.0)
+
+    # Predict with no lineups
+    p_null = book.win_prob(SPIRIT, AURORA, at=0, lineups=None)
+    assert p_null > 0.5
+
+    # Update map with no lineups
+    book.update_map(0, SPIRIT, AURORA, lineups=None)
+    assert book.state(SPIRIT).lineup == frozenset({1, 2, 3, 4, 5})
+
+    # Predict again with original lineup
+    p_orig = book.win_prob(
+        SPIRIT,
+        AURORA,
+        at=10,
+        lineups={SPIRIT: frozenset({1, 2, 3, 4, 5}), AURORA: frozenset({11, 12, 13, 14, 15})},
+    )
+    assert p_orig > 0.5
+    inf_orig = book._inflated(SPIRIT, 10, lineup=frozenset({1, 2, 3, 4, 5}))
+    inf_unadjusted = book._inflated(SPIRIT, 10, lineup=None)
+    assert inf_orig.rd == pytest.approx(inf_unadjusted.rd)
+
+
+def test_substituted_team_win_moves_rating_further():
+    config = Glicko2Config(roster_rd_boost=60.0)
+
+    # Book 1: unchanged lineup
+    book1 = RatingBook(config)
+    book1.states[SPIRIT] = _internal(1500.0, 100.0)
+    book1.states[SPIRIT].lineup = frozenset({1, 2, 3, 4, 5})
+    book1.states[AURORA] = _internal(1500.0, 100.0)
+    book1.states[AURORA].lineup = frozenset({11, 12, 13, 14, 15})
+
+    lineup_clean = {SPIRIT: frozenset({1, 2, 3, 4, 5}), AURORA: frozenset({11, 12, 13, 14, 15})}
+    book1.update_map(0, SPIRIT, AURORA, lineups=lineup_clean)
+
+    # Book 2: substituted lineup (3 stand-ins)
+    book2 = RatingBook(config)
+    book2.states[SPIRIT] = _internal(1500.0, 100.0)
+    book2.states[SPIRIT].lineup = frozenset({1, 2, 3, 4, 5})
+    book2.states[AURORA] = _internal(1500.0, 100.0)
+    book2.states[AURORA].lineup = frozenset({11, 12, 13, 14, 15})
+
+    lineup_subbed = {SPIRIT: frozenset({1, 2, 97, 98, 99}), AURORA: frozenset({11, 12, 13, 14, 15})}
+    book2.update_map(0, SPIRIT, AURORA, lineups=lineup_subbed)
+
+    # Substituted team win moves rating further
+    assert book2.state(SPIRIT).rating > book1.state(SPIRIT).rating
+
+
+def test_load_lineups_maps_teams_and_drops_partial_sides(conn):
+    # Match 1: 5 radiant (SPIRIT), 5 dire (AURORA)
+    # Match 2: 4 radiant (SPIRIT), 5 dire (AURORA)
+    # Match 3: 5 radiant (no team_id), 5 dire (FALCONS)
+    storage.upsert_matches(
+        conn,
+        [
+            _match(1, 1 * HOUR, 1, radiant=SPIRIT, dire=AURORA),
+            _match(2, 2 * HOUR, 1, radiant=SPIRIT, dire=AURORA),
+            _match(3, 3 * HOUR, 1, radiant=None, dire=FALCONS),
+        ],
+    )
+    players = [
+        {"match_id": 1, "player_slot": i, "account_id": 100 + i, "is_radiant": 1}
+        for i in range(5)
+    ] + [
+        {"match_id": 1, "player_slot": 128 + i, "account_id": 200 + i, "is_radiant": 0}
+        for i in range(5)
+    ] + [
+        {"match_id": 2, "player_slot": i, "account_id": 100 + i, "is_radiant": 1}
+        for i in range(4)
+    ] + [
+        {"match_id": 2, "player_slot": 128 + i, "account_id": 200 + i, "is_radiant": 0}
+        for i in range(5)
+    ] + [
+        {"match_id": 3, "player_slot": i, "account_id": 300 + i, "is_radiant": 1}
+        for i in range(5)
+    ] + [
+        {"match_id": 3, "player_slot": 128 + i, "account_id": 400 + i, "is_radiant": 0}
+        for i in range(5)
+    ]
+
+    storage.upsert_match_players(conn, players)
+
+    lineups = load_lineups(conn)
+    assert 1 in lineups
+    assert lineups[1][SPIRIT] == frozenset({100, 101, 102, 103, 104})
+    assert lineups[1][AURORA] == frozenset({200, 201, 202, 203, 204})
+
+    assert 2 in lineups
+    assert SPIRIT not in lineups[2]
+    assert lineups[2][AURORA] == frozenset({200, 201, 202, 203, 204})
+
+    assert 3 in lineups
+    assert FALCONS in lineups[3]
+    assert len(lineups[3]) == 1
+
+
+def test_win_prob_leak_freeness_leaves_stored_state_unchanged():
+    config = Glicko2Config(patch_rd_boost=60.0, roster_rd_boost=60.0)
+    book = RatingBook(config)
+    book.states[SPIRIT] = _internal(1700.0, 50.0)
+    book.states[SPIRIT].last_patch = 59
+    book.states[SPIRIT].lineup = frozenset({1, 2, 3, 4, 5})
+    book.states[AURORA] = _internal(1400.0, 50.0)
+    book.states[AURORA].last_patch = 59
+    book.states[AURORA].lineup = frozenset({11, 12, 13, 14, 15})
+
+    before_s = replace(book.state(SPIRIT))
+    before_a = replace(book.state(AURORA))
+
+    p = book.win_prob(
+        SPIRIT,
+        AURORA,
+        at=100 * DAY,
+        patch=60,
+        lineups={SPIRIT: frozenset({1, 2, 3, 4, 99}), AURORA: frozenset({11, 12, 13, 14, 99})},
+    )
+    assert 0.0 < p < 1.0
+    assert book.state(SPIRIT) == before_s
+    assert book.state(AURORA) == before_a

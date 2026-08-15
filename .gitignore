@@ -6,3 +6,5 @@ __pycache__/
 .ruff_cache/
 *.egg-info/
 .env
+.DS_Store
+.claude/settings.local.json

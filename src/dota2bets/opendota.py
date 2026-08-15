@@ -10,7 +10,8 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
+from datetime import datetime
 from typing import Any
 
 import httpx
@@ -44,6 +45,8 @@ class OpenDotaClient:
             base_url=BASE_URL, timeout=timeout, headers={"User-Agent": "dota2bets/0.1"}
         )
         self._last_call = 0.0
+        self._patch_index: dict[str, int] | None = None
+        self._patch_timeline: list[tuple[int, int]] | None = None
 
     def __enter__(self) -> OpenDotaClient:
         return self
@@ -115,6 +118,41 @@ class OpenDotaClient:
 
     def match(self, match_id: int) -> dict[str, Any]:
         return self.get(f"/matches/{match_id}")
+
+    def explorer(self, sql: str) -> list[dict[str, Any]]:
+        """Query the OpenDota PostgreSQL Explorer endpoint."""
+        data = self.get("/explorer", sql=sql)
+        if isinstance(data, dict) and data.get("err"):
+            raise RuntimeError(f"OpenDota Explorer query failed: {data['err']}")
+        if isinstance(data, dict) and "rows" in data:
+            return data["rows"]
+        if isinstance(data, list):
+            return data
+        return []
+
+    def patch_index(self) -> dict[str, int]:
+        """Fetch patch constants and map version name (e.g. '7.41') to integer id (e.g. 60)."""
+        if self._patch_index is None:
+            data = self.get("/constants/patch")
+            self._patch_index = {
+                p["name"]: p["id"]
+                for p in data
+                if isinstance(p, dict) and "name" in p and "id" in p
+            }
+            self._patch_timeline = build_patch_timeline(data)
+        return self._patch_index
+
+    def patch_timeline(self) -> list[tuple[int, int]]:
+        """Patch releases as ``(released_at, patch_id)``, oldest first.
+
+        The Explorer ``match_patch`` table can lag a release by days: matches played
+        after 7.41 shipped were still labelled '7.40' months later. `/matches/{id}`
+        assigns the patch by start time instead, so we do the same and treat the name
+        only as a fallback.
+        """
+        if self._patch_timeline is None:
+            self.patch_index()
+        return self._patch_timeline or []
 
 
 def parse_match_summary(m: dict[str, Any]) -> dict[str, Any]:
@@ -222,6 +260,199 @@ def parse_match_detail(d: dict[str, Any], fetched_at: int | None = None) -> dict
 
     return {
         "match": match_row,
+        "draft_events": draft_events,
+        "players": players,
+        "timeseries": timeseries,
+        "teams": teams,
+        "rosters": rosters,
+    }
+
+
+def build_patch_timeline(constants: Sequence[dict[str, Any]]) -> list[tuple[int, int]]:
+    """Turn `/constants/patch` into ``(released_at, patch_id)`` pairs, oldest first."""
+    timeline: list[tuple[int, int]] = []
+    for p in constants:
+        if not isinstance(p, dict) or "id" not in p or not p.get("date"):
+            continue
+        try:
+            released = int(
+                datetime.fromisoformat(str(p["date"]).replace("Z", "+00:00")).timestamp()
+            )
+        except ValueError:
+            continue
+        timeline.append((released, p["id"]))
+    timeline.sort()
+    return timeline
+
+
+def resolve_patch(
+    start_time: int | None,
+    patch_name: Any,
+    patch_map: dict[str, int],
+    patch_timeline: Sequence[tuple[int, int]] | None = None,
+) -> int | None:
+    """The patch a match was played on, preferring its start time over its label.
+
+    Explorer's `match_patch` lags a release — matches played in the two days after
+    7.41 shipped are still labelled '7.40'. Since the patch column feeds the ratings'
+    patch-transition feature, a stale label shifts a transition by days. `/matches/{id}`
+    derives the patch from the start time, so we do too, and fall back to the label
+    only when the start time cannot place the match.
+    """
+    if isinstance(patch_name, int):
+        return patch_name
+    if start_time and patch_timeline:
+        latest: int | None = None
+        for released, patch_id in patch_timeline:
+            if start_time >= released:
+                latest = patch_id
+            else:
+                break
+        if latest is not None:
+            return latest
+    if isinstance(patch_name, str):
+        return patch_map.get(patch_name)
+    return None
+
+
+def parse_explorer_rows(
+    matches: Sequence[dict[str, Any]],
+    picks_bans: Sequence[dict[str, Any]],
+    player_matches: Sequence[dict[str, Any]],
+    patch_map: dict[str, int],
+    *,
+    patch_timeline: Sequence[tuple[int, int]] | None = None,
+    fetched_at: int | None = None,
+) -> dict[str, Any]:
+    """Parse Explorer query results into rows for each table.
+
+    Returns a dict with keys ``match``, ``draft_events``, ``players``, ``timeseries``,
+    ``teams`` and ``rosters``, where ``match`` is a list of match rows.
+    """
+    fetched_at = fetched_at or int(time.time())
+
+    pb_by_match: dict[int, list[dict[str, Any]]] = {}
+    for pb in picks_bans:
+        mid = pb.get("match_id")
+        if mid is not None and pb.get("hero_id") is not None:
+            pb_by_match.setdefault(mid, []).append(pb)
+
+    pm_by_match: dict[int, list[dict[str, Any]]] = {}
+    for pm in player_matches:
+        mid = pm.get("match_id")
+        if mid is not None:
+            pm_by_match.setdefault(mid, []).append(pm)
+
+    match_rows: list[dict[str, Any]] = []
+    draft_events: list[dict[str, Any]] = []
+    players: list[dict[str, Any]] = []
+    timeseries: list[dict[str, Any]] = []
+    teams: list[dict[str, Any]] = []
+    rosters: list[dict[str, Any]] = []
+
+    for m in matches:
+        match_id = m["match_id"]
+        patch_idx = resolve_patch(
+            m.get("start_time"), m.get("patch"), patch_map, patch_timeline
+        )
+
+        m_players = pm_by_match.get(match_id, [])
+        m_pb = pb_by_match.get(match_id, [])
+
+        is_complete = (patch_idx is not None) and (len(m_players) == 10)
+        detail_fetched = fetched_at if is_complete else None
+
+        league_id = m.get("leagueid") if m.get("league_id") is None else m.get("league_id")
+        match_rows.append(
+            {
+                "match_id": match_id,
+                "league_id": league_id,
+                "league_name": m.get("league_name") or m.get("name"),
+                "series_id": m.get("series_id"),
+                "series_type": m.get("series_type"),
+                "start_time": m.get("start_time"),
+                "duration": m.get("duration"),
+                "pre_game_duration": None,
+                "patch": patch_idx,
+                "radiant_team_id": m.get("radiant_team_id"),
+                "radiant_name": m.get("radiant_name"),
+                "dire_team_id": m.get("dire_team_id"),
+                "dire_name": m.get("dire_name"),
+                "radiant_win": _as_int_bool(m.get("radiant_win")),
+                "radiant_score": m.get("radiant_score"),
+                "dire_score": m.get("dire_score"),
+                "detail_fetched_at": detail_fetched,
+            }
+        )
+
+        for i, pb in enumerate(m_pb):
+            draft_events.append(
+                {
+                    "match_id": match_id,
+                    "ord": pb.get("order") if pb.get("order") is not None else pb.get("ord", i),
+                    "is_pick": int(bool(pb.get("is_pick"))),
+                    "hero_id": pb["hero_id"],
+                    "team": pb.get("team"),
+                }
+            )
+
+        for p in m_players:
+            slot = p.get("player_slot", 0)
+            is_radiant = 1 if slot < 128 else 0
+            players.append(
+                {
+                    "match_id": match_id,
+                    "player_slot": slot,
+                    "account_id": p.get("account_id"),
+                    "player_name": None,
+                    "hero_id": p.get("hero_id"),
+                    "is_radiant": is_radiant,
+                    "lane_role": p.get("lane_role"),
+                    "kills": p.get("kills"),
+                    "deaths": p.get("deaths"),
+                    "assists": p.get("assists"),
+                    "gold_per_min": p.get("gold_per_min"),
+                    "xp_per_min": p.get("xp_per_min"),
+                }
+            )
+            team_id = m.get("radiant_team_id") if is_radiant else m.get("dire_team_id")
+            if team_id and p.get("account_id"):
+                rosters.append(
+                    {
+                        "team_id": team_id,
+                        "account_id": p["account_id"],
+                        "player_name": None,
+                        "observed_at": m.get("start_time") or fetched_at,
+                    }
+                )
+
+        gold = m.get("radiant_gold_adv") or []
+        xp = m.get("radiant_xp_adv") or []
+        for i in range(max(len(gold), len(xp))):
+            timeseries.append(
+                {
+                    "match_id": match_id,
+                    "minute": i,
+                    "radiant_gold_adv": gold[i] if i < len(gold) else None,
+                    "radiant_xp_adv": xp[i] if i < len(xp) else None,
+                }
+            )
+
+        for tid, name in (
+            (m.get("radiant_team_id"), m.get("radiant_name")),
+            (m.get("dire_team_id"), m.get("dire_name")),
+        ):
+            if tid:
+                teams.append(
+                    {
+                        "team_id": tid,
+                        "name": name,
+                        "last_seen": m.get("start_time") or fetched_at,
+                    }
+                )
+
+    return {
+        "match": match_rows,
         "draft_events": draft_events,
         "players": players,
         "timeseries": timeseries,

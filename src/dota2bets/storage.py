@@ -425,5 +425,29 @@ def summary(conn: sqlite3.Connection) -> dict[str, Any]:
     return out
 
 
+def enrichment_coverage(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Return coverage counts across patch, players, draft, and full detail."""
+    total = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+    with_detail = conn.execute(
+        "SELECT COUNT(*) FROM matches WHERE detail_fetched_at IS NOT NULL"
+    ).fetchone()[0]
+    with_patch = conn.execute("SELECT COUNT(*) FROM matches WHERE patch IS NOT NULL").fetchone()[0]
+    with_draft = conn.execute("SELECT COUNT(DISTINCT match_id) FROM draft_events").fetchone()[0]
+    sql_players = (
+        "SELECT COUNT(*) FROM ("
+        "  SELECT match_id FROM match_players GROUP BY match_id HAVING COUNT(*) = 10"
+        ")"
+    )
+    with_players = conn.execute(sql_players).fetchone()[0]
+    return {
+        "total": total,
+        "with_detail": with_detail,
+        "with_patch": with_patch,
+        "with_draft": with_draft,
+        "with_players": with_players,
+    }
+
+
 def dump_json(obj: Any) -> str:
     return json.dumps(obj, indent=2, sort_keys=True, default=str)
+

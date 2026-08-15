@@ -1,0 +1,21 @@
+[
+  {
+    "match_id": 8943332564,
+    "leagueid": 19719,
+    "league_name": "The International 2026",
+    "series_id": 1130063,
+    "series_type": 1,
+    "start_time": 1786618550,
+    "duration": 4566,
+    "radiant_team_id": 10150538,
+    "radiant_name": "LGD Gaming",
+    "dire_team_id": 5017210,
+    "dire_name": "Team Resilience",
+    "radiant_win": true,
+    "radiant_score": 54,
+    "dire_score": 33,
+    "patch": "7.41",
+    "radiant_gold_adv": [0, -163, -221, -380],
+    "radiant_xp_adv": [0, -116, 159, 85]
+  }
+]

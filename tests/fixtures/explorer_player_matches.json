@@ -1,0 +1,12 @@
+[
+  {"match_id": 8943332564, "player_slot": 0, "account_id": 177203952, "hero_id": 18, "kills": 23, "deaths": 2, "assists": 12, "gold_per_min": 927, "xp_per_min": 1129, "lane_role": 1},
+  {"match_id": 8943332564, "player_slot": 1, "account_id": 94054712, "hero_id": 120, "kills": 10, "deaths": 5, "assists": 31, "gold_per_min": 724, "xp_per_min": 1103, "lane_role": 2},
+  {"match_id": 8943332564, "player_slot": 2, "account_id": 292921272, "hero_id": 33, "kills": 7, "deaths": 10, "assists": 24, "gold_per_min": 747, "xp_per_min": 806, "lane_role": 3},
+  {"match_id": 8943332564, "player_slot": 3, "account_id": 105045291, "hero_id": 119, "kills": 5, "deaths": 11, "assists": 33, "gold_per_min": 428, "xp_per_min": 869, "lane_role": 3},
+  {"match_id": 8943332564, "player_slot": 4, "account_id": 81306398, "hero_id": 112, "kills": 7, "deaths": 5, "assists": 26, "gold_per_min": 393, "xp_per_min": 732, "lane_role": 1},
+  {"match_id": 8943332564, "player_slot": 128, "account_id": 170896543, "hero_id": 6, "kills": 10, "deaths": 6, "assists": 11, "gold_per_min": 907, "xp_per_min": 958, "lane_role": 1},
+  {"match_id": 8943332564, "player_slot": 129, "account_id": 315272623, "hero_id": 13, "kills": 6, "deaths": 8, "assists": 15, "gold_per_min": 726, "xp_per_min": 964, "lane_role": 2},
+  {"match_id": 8943332564, "player_slot": 130, "account_id": 145957968, "hero_id": 96, "kills": 6, "deaths": 11, "assists": 14, "gold_per_min": 526, "xp_per_min": 662, "lane_role": 3},
+  {"match_id": 8943332564, "player_slot": 131, "account_id": 150961567, "hero_id": 105, "kills": 8, "deaths": 12, "assists": 17, "gold_per_min": 486, "xp_per_min": 558, "lane_role": 3},
+  {"match_id": 8943332564, "player_slot": 132, "account_id": 249835593, "hero_id": 85, "kills": 2, "deaths": 17, "assists": 17, "gold_per_min": 365, "xp_per_min": 509, "lane_role": 1}
+]

@@ -28,8 +28,16 @@ import time
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 
+from .draft import DraftConfig, DraftModel, load_drafts
 from .evaluation import Prediction
-from .ratings import Glicko2Config, RatingBook, apply_row, rating_rows, series_win_prob
+from .ratings import (
+    Glicko2Config,
+    RatingBook,
+    apply_row,
+    load_lineups,
+    rating_rows,
+    series_win_prob,
+)
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +87,15 @@ def _log_loss(prob: float, outcome: int) -> float:
 
 
 @dataclass
+class DraftEventPredictions:
+    """Event predictions plus the population they were produced over."""
+
+    predictions: list[Prediction]
+    n_maps: int = 0
+    n_fallback: int = 0
+
+
+@dataclass
 class ScoreCard:
     """Proper scores over a set of binary predictions."""
 
@@ -87,15 +104,17 @@ class ScoreCard:
     log_loss: float | None = None
     #: Brier of always saying 0.5 -- the only baseline available without a market.
     baseline_brier: float = 0.25
+    n_fallback: int = 0
 
     @classmethod
-    def build(cls, scored: Sequence[tuple[float, int]]) -> ScoreCard:
+    def build(cls, scored: Sequence[tuple[float, int]], n_fallback: int = 0) -> ScoreCard:
         if not scored:
-            return cls()
+            return cls(n_fallback=n_fallback)
         return cls(
             n=len(scored),
             brier=sum((p - o) ** 2 for p, o in scored) / len(scored),
             log_loss=sum(_log_loss(p, o) for p, o in scored) / len(scored),
+            n_fallback=n_fallback,
         )
 
 
@@ -118,19 +137,99 @@ def walk_forward(
     prediction is 0.5 and the score measures nothing but how many new teams appeared.
     """
     book = RatingBook(config)
+    lineups_by_match = (
+        load_lineups(conn) if book.config.roster_rd_boost is not None else None
+    )
     scored: list[tuple[float, int]] = []
     for row in rating_rows(conn, before=end):
         at = int(row["start_time"])
+        r_id = int(row["radiant_team_id"])
+        d_id = int(row["dire_team_id"])
+        match_id = int(row["match_id"])
         warm = (
-            book.state(int(row["radiant_team_id"])).games >= min_games
-            and book.state(int(row["dire_team_id"])).games >= min_games
+            book.state(r_id).games >= min_games
+            and book.state(d_id).games >= min_games
         )
         in_scope = score_leagues is None or row["league_id"] in score_leagues
+        patch = None
+        try:
+            raw_patch = row["patch"]
+            if raw_patch is not None:
+                patch = int(raw_patch)
+        except (KeyError, IndexError):
+            patch = None
+        match_lineups = lineups_by_match.get(match_id) if lineups_by_match else None
         if (start_scoring is None or at >= start_scoring) and in_scope and warm:
-            prob = book.win_prob(int(row["radiant_team_id"]), int(row["dire_team_id"]), at)
+            prob = book.win_prob(r_id, d_id, at, patch=patch, lineups=match_lineups)
             scored.append((prob, 1 if row["radiant_win"] else 0))
-        apply_row(book, row)
+        apply_row(book, row, lineups=match_lineups)
     return ScoreCard.build(scored)
+
+
+def walk_forward_draft(
+    conn: sqlite3.Connection,
+    draft_config: DraftConfig | None = None,
+    ratings_config: Glicko2Config | None = None,
+    *,
+    start_scoring: int | None = None,
+    end: int | None = None,
+    score_leagues: set[int] | None = None,
+    min_games: int = 0,
+) -> ScoreCard:
+    """Predict-then-update over history advancing ratings and draft model together.
+
+    Every row trains both models in one chronological pass. Fallback maps are counted
+    and reported in the ScoreCard.
+    """
+    d_config = draft_config or DraftConfig()
+    book = RatingBook(ratings_config)
+    draft_model = DraftModel(d_config)
+    drafts_by_match = load_drafts(conn)
+    lineups_by_match = (
+        load_lineups(conn) if book.config.roster_rd_boost is not None else None
+    )
+    scored: list[tuple[float, int]] = []
+    n_fallback = 0
+
+    for row in rating_rows(conn, before=end):
+        at = int(row["start_time"])
+        r_id = int(row["radiant_team_id"])
+        d_id = int(row["dire_team_id"])
+        match_id = int(row["match_id"])
+        warm = (
+            book.state(r_id).games >= min_games
+            and book.state(d_id).games >= min_games
+        )
+        in_scope = score_leagues is None or row["league_id"] in score_leagues
+        patch = None
+        try:
+            raw_patch = row["patch"]
+            if raw_patch is not None:
+                patch = int(raw_patch)
+        except (KeyError, IndexError):
+            patch = None
+        match_lineups = lineups_by_match.get(match_id) if lineups_by_match else None
+        draft = drafts_by_match.get(match_id)
+
+        # 1. Rating probability
+        p_glicko = book.win_prob(r_id, d_id, at, patch=patch, lineups=match_lineups)
+
+        # 2. Draft model probability
+        prob, is_fallback, features = draft_model.predict(
+            r_id, d_id, at, p_glicko, draft
+        )
+
+        if (start_scoring is None or at >= start_scoring) and in_scope and warm:
+            scored.append((prob, 1 if row["radiant_win"] else 0))
+            if is_fallback:
+                n_fallback += 1
+
+        # 3. Update both models with match outcome
+        radiant_win = bool(row["radiant_win"])
+        draft_model.update(r_id, d_id, at, radiant_win, draft, features=features)
+        apply_row(book, row, lineups=match_lineups)
+
+    return ScoreCard.build(scored, n_fallback=n_fallback)
 
 
 def tune(
@@ -165,13 +264,52 @@ def tune(
     return results
 
 
+def tune_draft(
+    conn: sqlite3.Connection,
+    grid: Iterable[DraftConfig],
+    ratings_config: Glicko2Config | None = None,
+    *,
+    start_scoring: int | None = None,
+    end: int | None = None,
+    score_leagues: set[int] | None = None,
+    min_games: int = 0,
+) -> list[tuple[DraftConfig, ScoreCard]]:
+    """Rank draft configs by walk-forward log-loss."""
+    results = [
+        (
+            config,
+            walk_forward_draft(
+                conn,
+                draft_config=config,
+                ratings_config=ratings_config,
+                start_scoring=start_scoring,
+                end=end,
+                score_leagues=score_leagues,
+                min_games=min_games,
+            ),
+        )
+        for config in grid
+    ]
+    results.sort(key=lambda r: (r[1].log_loss is None, r[1].log_loss))
+    return results
+
+
 def default_grid() -> list[Glicko2Config]:
     """A small deterministic grid; each config is one cheap pass over the history."""
     return [
-        Glicko2Config(tau=tau, idle_period_s=idle, initial_rd=rd)
-        for tau in (0.3, 0.5, 0.8, 1.2)
-        for idle in (14.0 * 86400, 30.0 * 86400, 60.0 * 86400, None)
-        for rd in (350.0,)
+        Glicko2Config(patch_rd_boost=patch, roster_rd_boost=roster)
+        for patch in (None, 30.0, 60.0, 100.0)
+        for roster in (None, 30.0, 60.0, 100.0)
+    ]
+
+
+def default_draft_grid() -> list[DraftConfig]:
+    """Tuning grid over half-life, pair shrinkage, and learning rate."""
+    return [
+        DraftConfig(half_life_days=hl, k_pair=kp, learning_rate=lr)
+        for hl in (60.0, 120.0, 240.0)
+        for kp in (50.0, 100.0, 200.0)
+        for lr in (0.01, 0.05, 0.1)
     ]
 
 
@@ -188,6 +326,8 @@ class SeriesInfo:
     name_a: str
     name_b: str
     n_maps: int
+    patch: int | None = None
+    first_match_id: int | None = None
 
 
 def league_id_for(conn: sqlite3.Connection, name: str = DEFAULT_LEAGUE_NAME) -> int | None:
@@ -239,15 +379,18 @@ def event_series(
     out: list[SeriesInfo] = []
     for row in rows:
         first = conn.execute(
-            "SELECT series_type, radiant_team_id, dire_team_id, radiant_name, dire_name "
+            "SELECT series_type, radiant_team_id, dire_team_id, radiant_name, dire_name, "
+            "       patch, match_id "
             "FROM matches WHERE series_id = ? AND start_time IS NOT NULL "
-            "ORDER BY start_time LIMIT 1",
+            "ORDER BY start_time, match_id LIMIT 1",
             (row["series_id"],),
         ).fetchone()
         if first is None or first["radiant_team_id"] is None or first["dire_team_id"] is None:
             continue
         team_a, team_b = int(first["radiant_team_id"]), int(first["dire_team_id"])
         quoted = _quoted_names(conn, int(row["series_id"]), source)
+        patch = int(first["patch"]) if first["patch"] is not None else None
+        first_match_id = int(first["match_id"]) if first["match_id"] is not None else None
         out.append(
             SeriesInfo(
                 series_id=int(row["series_id"]),
@@ -261,6 +404,8 @@ def event_series(
                 name_a=quoted.get(team_a) or str(first["radiant_name"] or team_a),
                 name_b=quoted.get(team_b) or str(first["dire_name"] or team_b),
                 n_maps=int(row["n_maps"]),
+                patch=patch,
+                first_match_id=first_match_id,
             )
         )
     return out
@@ -276,13 +421,29 @@ def _frozen_books(
     nothing but runtime.
     """
     book = RatingBook(config)
+    lineups_by_match = (
+        load_lineups(conn) if book.config.roster_rd_boost is not None else None
+    )
     rows = rating_rows(conn)
     pending = next(rows, None)
     for info in series:
         while pending is not None and int(pending["start_time"]) < info.start_time:
-            apply_row(book, pending)
+            p_match_id = int(pending["match_id"])
+            p_lineups = lineups_by_match.get(p_match_id) if lineups_by_match else None
+            apply_row(book, pending, lineups=p_lineups)
             pending = next(rows, None)
-        yield info, book.win_prob(info.team_a, info.team_b, info.start_time)
+        first_lineups = (
+            lineups_by_match.get(info.first_match_id)
+            if lineups_by_match and info.first_match_id is not None
+            else None
+        )
+        yield info, book.win_prob(
+            info.team_a,
+            info.team_b,
+            info.start_time,
+            patch=info.patch,
+            lineups=first_lineups,
+        )
 
 
 def event_predictions(
@@ -312,6 +473,101 @@ def event_predictions(
             preds.append(Prediction(info.series_id, period, info.name_a, p_map))
             preds.append(Prediction(info.series_id, period, info.name_b, 1.0 - p_map))
     return preds
+
+
+def event_predictions_draft(
+    conn: sqlite3.Connection,
+    league_id: int,
+    draft_config: DraftConfig | None = None,
+    ratings_config: Glicko2Config | None = None,
+    source: str = "pinnacle",
+) -> list[Prediction]:
+    """Per-map draft predictions for a league's matches, ready for ``dota2bets eval``.
+
+    Emits both sides for every map, with period = index of map in series (1, 2, 3...).
+    Ratings and draft statistics advance chronologically map-by-map. Returns the
+    predictions alongside the map count and how many of those maps had no usable draft.
+    """
+    d_config = draft_config or DraftConfig()
+    book = RatingBook(ratings_config)
+    draft_model = DraftModel(d_config)
+    drafts_by_match = load_drafts(conn)
+    lineups_by_match = (
+        load_lineups(conn) if book.config.roster_rd_boost is not None else None
+    )
+
+    # Pre-fetch series info and map order for target league
+    league_matches = conn.execute(
+        "SELECT match_id, series_id, start_time, radiant_team_id, dire_team_id, "
+        "       radiant_name, dire_name "
+        "FROM matches "
+        "WHERE league_id = ? AND series_id IS NOT NULL AND start_time IS NOT NULL "
+        "  AND radiant_team_id IS NOT NULL AND dire_team_id IS NOT NULL "
+        "ORDER BY start_time, match_id",
+        (league_id,),
+    ).fetchall()
+
+    n_target = 0
+    n_fallback = 0
+    target_maps: dict[int, tuple[int, int, str, str]] = {}
+    series_map_count: dict[int, int] = {}
+    series_quoted: dict[int, dict[int, str]] = {}
+
+    for row in league_matches:
+        m_id = int(row["match_id"])
+        s_id = int(row["series_id"])
+        if s_id not in series_quoted:
+            series_quoted[s_id] = _quoted_names(conn, s_id, source)
+        quoted = series_quoted[s_id]
+        rad_id = int(row["radiant_team_id"])
+        dire_id = int(row["dire_team_id"])
+        rad_name = quoted.get(rad_id) or str(row["radiant_name"] or rad_id)
+        dire_name = quoted.get(dire_id) or str(row["dire_name"] or dire_id)
+
+        series_map_count[s_id] = series_map_count.get(s_id, 0) + 1
+        period = series_map_count[s_id]
+        target_maps[m_id] = (s_id, period, rad_name, dire_name)
+
+    preds: list[Prediction] = []
+
+    for row in rating_rows(conn):
+        match_id = int(row["match_id"])
+        at = int(row["start_time"])
+        r_id = int(row["radiant_team_id"])
+        d_id = int(row["dire_team_id"])
+        patch = None
+        try:
+            raw_patch = row["patch"]
+            if raw_patch is not None:
+                patch = int(raw_patch)
+        except (KeyError, IndexError):
+            patch = None
+        match_lineups = lineups_by_match.get(match_id) if lineups_by_match else None
+        draft = drafts_by_match.get(match_id)
+
+        # 1. Predict
+        p_glicko = book.win_prob(r_id, d_id, at, patch=patch, lineups=match_lineups)
+        prob, is_fallback, features = draft_model.predict(
+            r_id, d_id, at, p_glicko, draft
+        )
+
+        # If this match belongs to target league, record prediction
+        if match_id in target_maps:
+            s_id, period, rad_name, dire_name = target_maps[match_id]
+            preds.append(Prediction(s_id, period, rad_name, prob))
+            preds.append(Prediction(s_id, period, dire_name, 1.0 - prob))
+            n_target += 1
+            if is_fallback:
+                n_fallback += 1
+
+        # 2. Update after prediction
+        radiant_win = bool(row["radiant_win"])
+        draft_model.update(r_id, d_id, at, radiant_win, draft, features=features)
+        apply_row(book, row, lineups=match_lineups)
+
+    # A score is meaningless without the population it was measured on: callers must be
+    # able to say how many priced maps had no usable draft and fell back to ratings.
+    return DraftEventPredictions(predictions=preds, n_maps=n_target, n_fallback=n_fallback)
 
 
 def write_predictions(path: str, predictions: Sequence[Prediction]) -> int:

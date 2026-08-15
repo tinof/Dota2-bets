@@ -6,16 +6,21 @@ from dota2bets import storage
 from dota2bets.aliases import AliasResolver
 from dota2bets.backtest import (
     ScoreCard,
+    default_draft_grid,
     default_grid,
     elite_league_ids,
     event_predictions,
+    event_predictions_draft,
     event_series,
     league_id_for,
     match_report,
     tune,
+    tune_draft,
     walk_forward,
+    walk_forward_draft,
     write_predictions,
 )
+from dota2bets.draft import DraftConfig
 from dota2bets.evaluation import clv_report, load_predictions
 from dota2bets.ratings import Glicko2Config
 
@@ -162,8 +167,58 @@ def test_tune_ranks_by_log_loss(conn):
 
 def test_default_grid_is_small_and_distinct():
     grid = default_grid()
-    assert 1 < len(grid) <= 32
-    assert len(set(grid)) == len(grid)
+    assert len(grid) == 16
+    assert len(set(grid)) == 16
+    for cfg in grid:
+        assert cfg.tau == 0.5
+        assert cfg.idle_period_s == 30.0 * 86400.0
+        assert cfg.initial_rd == 350.0
+
+
+def test_walk_forward_degrades_identically_without_data(conn):
+    storage.upsert_matches(conn, [_match(i, i * DAY, 1, i) for i in range(1, 30)])
+    card_none = walk_forward(conn, Glicko2Config())
+    card_boosts = walk_forward(conn, Glicko2Config(patch_rd_boost=60.0, roster_rd_boost=60.0))
+    assert card_boosts.n == card_none.n
+    assert card_boosts.brier == pytest.approx(card_none.brier)
+    assert card_boosts.log_loss == pytest.approx(card_none.log_loss)
+
+
+def test_frozen_series_price_unaffected_by_map3_lineup_change(conn):
+    storage.upsert_matches(
+        conn,
+        [
+            _match(1, MAP1, 1, 555),
+            _match(2, MAP2, 0, 555),
+            _match(3, MAP2 + HOUR, 1, 555),
+        ],
+    )
+    players = [
+        {"match_id": 1, "player_slot": i, "account_id": 100 + i, "is_radiant": 1}
+        for i in range(5)
+    ] + [
+        {"match_id": 1, "player_slot": 128 + i, "account_id": 200 + i, "is_radiant": 0}
+        for i in range(5)
+    ] + [
+        {"match_id": 2, "player_slot": i, "account_id": 100 + i, "is_radiant": 1}
+        for i in range(5)
+    ] + [
+        {"match_id": 2, "player_slot": 128 + i, "account_id": 200 + i, "is_radiant": 0}
+        for i in range(5)
+    ] + [
+        {"match_id": 3, "player_slot": i, "account_id": 900 + i, "is_radiant": 1}
+        for i in range(5)
+    ] + [
+        {"match_id": 3, "player_slot": 128 + i, "account_id": 200 + i, "is_radiant": 0}
+        for i in range(5)
+    ]
+    storage.upsert_match_players(conn, players)
+
+    config = Glicko2Config(roster_rd_boost=60.0)
+    preds = event_predictions(conn, LEAGUE, config=config)
+    p1 = [p.prob for p in preds if p.selection == "Team Spirit" and p.period == 1][0]
+    p3 = [p.prob for p in preds if p.selection == "Team Spirit" and p.period == 3][0]
+    assert p1 == pytest.approx(p3)
 
 
 def test_elite_league_ids_matches_on_name(conn):
@@ -291,3 +346,73 @@ def test_match_report_freezes_before_the_series(conn):
     assert report.overall.n == 2
     # Spirit won one and lost one from an identical 0.5 prior.
     assert report.overall.brier == pytest.approx(0.25)
+
+
+# ------------------------------------------------------------------ draft backtest
+
+
+def test_disabled_draft_walk_forward_reproduces_ratings_baseline(conn):
+    """Disabled-draft walk-forward produces exact same ScoreCard as ratings walk-forward."""
+    storage.upsert_matches(
+        conn,
+        [
+            _match(1, 1 * DAY, 1, 10),
+            _match(2, 2 * DAY, 0, 11),
+            _match(3, 3 * DAY, 1, 12),
+        ],
+    )
+    ratings_card = walk_forward(conn)
+    draft_card = walk_forward_draft(conn, draft_config=DraftConfig(disabled=True))
+    assert ratings_card.n == draft_card.n
+    assert ratings_card.brier == pytest.approx(draft_card.brier)
+    assert ratings_card.log_loss == pytest.approx(draft_card.log_loss)
+
+
+def test_walk_forward_draft_bound_enforced(conn):
+    """Rows after the bound cannot change a scorecard."""
+    storage.upsert_matches(
+        conn,
+        [
+            _match(1, 100, 1, 1),
+            _match(2, 200, 0, 2),
+            _match(3, 300, 1, 3),
+        ],
+    )
+    card_bounded = walk_forward_draft(conn, end=250)
+    assert card_bounded.n == 2
+
+
+def test_event_predictions_draft_two_sided_sum_to_one_and_period_indices(ti_db):
+    """Per-map predictions emit both sides summing to one with correct period indices."""
+    result = event_predictions_draft(ti_db, LEAGUE)
+    preds = result.predictions
+    assert len(preds) > 0
+    # The population is reported alongside the predictions, never left implicit.
+    assert result.n_maps == len(preds) // 2
+    assert 0 <= result.n_fallback <= result.n_maps
+    by_period: dict[int, list[float]] = {}
+    for p in preds:
+        by_period.setdefault(p.period, []).append(p.prob)
+    # Draft predictions are per-map (periods 1, 2)
+    assert set(by_period.keys()) == {1, 2}
+    for _period, probs in by_period.items():
+        assert len(probs) == 2
+        assert sum(probs) == pytest.approx(1.0)
+
+
+def test_tune_draft_ranks_configs(conn):
+    """tune_draft searches grid and ranks by log-loss."""
+    storage.upsert_matches(
+        conn,
+        [
+            _match(1, 100, 1, 1),
+            _match(2, 200, 0, 2),
+        ],
+    )
+    grid = default_draft_grid()[:3]
+    results = tune_draft(conn, grid)
+    assert len(results) == 3
+    assert all(isinstance(res[1], ScoreCard) for res in results)
+    # Ranked ascending by log-loss
+    losses = [r[1].log_loss for r in results if r[1].log_loss is not None]
+    assert losses == sorted(losses)

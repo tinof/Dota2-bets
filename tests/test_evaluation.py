@@ -8,6 +8,7 @@ from dota2bets import storage
 from dota2bets.aliases import AliasResolver
 from dota2bets.evaluation import (
     Prediction,
+    append_prediction,
     closing_event,
     closing_lines,
     closing_probs,
@@ -19,6 +20,7 @@ from dota2bets.evaluation import (
     map_start,
     overround,
     resolve_outcome,
+    settle_paper_trades,
     shin_z,
 )
 
@@ -346,3 +348,355 @@ def test_cmd_eval_end_to_end(series_db, tmp_path, capsys, monkeypatch):
     assert "model Brier" in out
     assert "closing Brier" in out
     assert "mean CLV" in out
+
+
+# ------------------------------------------------------------------- paper trading
+
+
+def test_append_prediction_and_load(tmp_path):
+    log_path = tmp_path / "paper_trades.jsonl"
+    pred = Prediction(
+        series_id=100,
+        period=1,
+        selection="Team Spirit",
+        prob=0.65,
+        price_taken=1.80,
+        placed_at=1700000000,
+        stake=50.0,
+    )
+    append_prediction(log_path, pred)
+    loaded = load_predictions(str(log_path))
+    assert len(loaded) == 1
+    assert loaded[0] == pred
+
+
+def test_settle_paper_trades_arithmetic(series_db, resolver):
+    """Settlement reports correct P&L, staked total, and CLV across won/lost/pending bets."""
+    trades = [
+        Prediction(
+            series_id=SERIES,
+            period=1,
+            selection="Spirit",
+            prob=0.70,
+            price_taken=2.00,
+            stake=100.0,
+        ),
+        Prediction(
+            series_id=SERIES,
+            period=2,
+            selection="Aurora",
+            prob=0.40,
+            price_taken=3.00,
+            stake=50.0,
+        ),
+        Prediction(
+            series_id=SERIES,
+            period=3,
+            selection="Spirit",
+            prob=0.60,
+            price_taken=1.70,
+            stake=20.0,
+        ),
+    ]
+    report = settle_paper_trades(series_db, trades, resolver=resolver)
+    # Map 1: Spirit won -> PnL = 100 * (2.0 - 1.0) = +100
+    # Map 2: Spirit won -> Aurora lost -> PnL = -50
+    # Map 3: the series never reached it -- pending (result not recorded *yet*), not
+    # unresolved, and excluded from realised P&L either way.
+    assert report.n_settled == 2
+    assert report.n_pending == 1
+    assert report.n_unresolved == 0
+    assert report.total_staked == pytest.approx(150.0)
+    assert report.realised_pnl == pytest.approx(50.0)
+    assert report.mean_clv is not None
+
+
+def test_cmd_bet_rehearsal_leaves_log_unchanged(series_db, tmp_path, monkeypatch, capsys):
+    from dota2bets import cli
+
+    db_path = series_db.execute("PRAGMA database_list").fetchone()[2]
+    series_db.commit()
+    log_path = tmp_path / "paper_trades.jsonl"
+    monkeypatch.setattr(
+        AliasResolver,
+        "load",
+        classmethod(lambda cls, path=None: AliasResolver.from_yaml(ALIAS_YAML)),
+    )
+    # Draft 10 distinct heroes
+    args = [
+        "--db",
+        db_path,
+        "bet",
+        "--series-id",
+        str(SERIES),
+        "--radiant-team",
+        "Spirit",
+        "--dire-team",
+        "Aurora",
+        "--period",
+        "1",
+        "--radiant",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "--dire",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "--trades-log",
+        str(log_path),
+        "--rehearse",
+    ]
+    code = cli.main(args)
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[REHEARSAL MODE]" in out
+    assert not log_path.exists()
+
+
+def test_cmd_bet_appends_real_trade(series_db, tmp_path, monkeypatch, capsys):
+    from dota2bets import cli
+
+    db_path = series_db.execute("PRAGMA database_list").fetchone()[2]
+    series_db.commit()
+    log_path = tmp_path / "paper_trades.jsonl"
+    monkeypatch.setattr(
+        AliasResolver,
+        "load",
+        classmethod(lambda cls, path=None: AliasResolver.from_yaml(ALIAS_YAML)),
+    )
+    args = [
+        "--db",
+        db_path,
+        "bet",
+        "--series-id",
+        str(SERIES),
+        "--radiant-team",
+        "Spirit",
+        "--dire-team",
+        "Aurora",
+        "--period",
+        "1",
+        "--radiant",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "--dire",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "--trades-log",
+        str(log_path),
+        "--allow-stale",
+    ]
+    code = cli.main(args)
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Proposed Trade" in out
+    assert log_path.exists()
+    loaded = load_predictions(str(log_path))
+    assert len(loaded) == 1
+    assert loaded[0].stake is not None
+    assert loaded[0].price_taken is not None
+    # The quote's observation time is stored, so settlement can say how stale it was.
+    assert loaded[0].quoted_at is not None
+
+
+def test_cmd_bet_no_open_quote_records_nothing(series_db, tmp_path, monkeypatch, capsys):
+    from dota2bets import cli
+
+    db_path = series_db.execute("PRAGMA database_list").fetchone()[2]
+    # Mark all open rows as closed
+    series_db.execute("UPDATE odds_snapshots SET status = 'closed'")
+    series_db.commit()
+    log_path = tmp_path / "paper_trades.jsonl"
+    monkeypatch.setattr(
+        AliasResolver,
+        "load",
+        classmethod(lambda cls, path=None: AliasResolver.from_yaml(ALIAS_YAML)),
+    )
+    args = [
+        "--db",
+        db_path,
+        "bet",
+        "--series-id",
+        str(SERIES),
+        "--radiant-team",
+        "Spirit",
+        "--dire-team",
+        "Aurora",
+        "--period",
+        "1",
+        "--radiant",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+        "--dire",
+        "6",
+        "7",
+        "8",
+        "9",
+        "10",
+        "--trades-log",
+        str(log_path),
+    ]
+    code = cli.main(args)
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "No open quote" in out
+    assert not log_path.exists()
+
+
+def test_cmd_bet_settle_reporting(series_db, tmp_path, monkeypatch, capsys):
+    from dota2bets import cli
+
+    db_path = series_db.execute("PRAGMA database_list").fetchone()[2]
+    series_db.commit()
+    log_path = tmp_path / "paper_trades.jsonl"
+    append_prediction(
+        log_path,
+        Prediction(
+            series_id=SERIES,
+            period=1,
+            selection="Spirit",
+            prob=0.7,
+            price_taken=1.60,
+            stake=50.0,
+        ),
+    )
+    monkeypatch.setattr(
+        AliasResolver,
+        "load",
+        classmethod(lambda cls, path=None: AliasResolver.from_yaml(ALIAS_YAML)),
+    )
+    args = [
+        "--db",
+        db_path,
+        "bet",
+        "--trades-log",
+        str(log_path),
+        "--settle",
+    ]
+    code = cli.main(args)
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "Settled 1 trades" in out
+    assert "Total Staked: $50.00" in out
+    assert "Realised P&L: $+30.00" in out
+
+
+def _bet_args(db_path, log_path, *extra):
+    return [
+        "--db", db_path, "bet",
+        "--series-id", str(SERIES),
+        "--radiant-team", "Spirit",
+        "--dire-team", "Aurora",
+        "--period", "1",
+        "--radiant", "1", "2", "3", "4", "5",
+        "--dire", "6", "7", "8", "9", "10",
+        "--trades-log", str(log_path),
+        *extra,
+    ]
+
+
+def test_cmd_bet_refuses_a_market_closed_after_its_last_open_quote(
+    series_db, tmp_path, monkeypatch, capsys
+):
+    """A newer 'closed' row supersedes the open one: listed is not the same as biddable.
+
+    odds_snapshots is append-only, so the newest *open* row survives forever. Selecting on
+    status first would quote a market that has since stopped taking bets.
+    """
+    from dota2bets import cli
+
+    db_path = series_db.execute("PRAGMA database_list").fetchone()[2]
+    for sel in ("Spirit", "Aurora"):
+        series_db.execute(
+            "INSERT INTO odds_snapshots "
+            "(source, event_id, line_key, market_type, period, selection, "
+            " price_decimal, status, is_live, captured_at) "
+            "VALUES ('pinnacle', '1', ?, 'moneyline', 1, ?, 2.0, 'closed', 0, ?)",
+            (f"1|Regular|moneyline|1|{sel}|", sel, MAP1 + 500),
+        )
+    series_db.commit()
+    monkeypatch.setattr(
+        AliasResolver,
+        "load",
+        classmethod(lambda cls, path=None: AliasResolver.from_yaml(ALIAS_YAML)),
+    )
+    assert cli.main(_bet_args(db_path, tmp_path / "t.jsonl", "--allow-stale")) == 0
+    out = capsys.readouterr().out
+    assert "No open quote" in out
+    assert not (tmp_path / "t.jsonl").exists()
+
+
+def test_cmd_bet_refuses_a_stale_quote_unless_overridden(
+    series_db, tmp_path, monkeypatch, capsys
+):
+    """A price observed long ago was not available to bet, so it must not be recorded."""
+    from dota2bets import cli
+
+    db_path = series_db.execute("PRAGMA database_list").fetchone()[2]
+    series_db.commit()
+    monkeypatch.setattr(
+        AliasResolver,
+        "load",
+        classmethod(lambda cls, path=None: AliasResolver.from_yaml(ALIAS_YAML)),
+    )
+    log_path = tmp_path / "t.jsonl"
+    assert cli.main(_bet_args(db_path, log_path)) == 0
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "Refusing to record" in out
+    assert not log_path.exists()
+
+
+def test_cmd_bet_staleness_uses_the_oldest_leg(series_db, tmp_path, monkeypatch, capsys):
+    """Age is the traded leg's age: one fresh leg must not mask a stale one."""
+    from dota2bets import cli
+
+    db_path = series_db.execute("PRAGMA database_list").fetchone()[2]
+    import time as _time
+
+    now = int(_time.time())
+    # Aurora quoted seconds ago, Spirit hours ago. max() would report "fresh".
+    for sel, price, captured in (("Aurora", 2.4, now - 5), ("Spirit", 1.7, now - 7200)):
+        series_db.execute(
+            "INSERT INTO odds_snapshots "
+            "(source, event_id, line_key, market_type, period, selection, "
+            " price_decimal, status, is_live, captured_at) "
+            "VALUES ('pinnacle', '1', ?, 'moneyline', 1, ?, ?, 'open', 0, ?)",
+            (f"1|Regular|moneyline|1|{sel}|", sel, price, captured),
+        )
+    series_db.commit()
+    monkeypatch.setattr(
+        AliasResolver,
+        "load",
+        classmethod(lambda cls, path=None: AliasResolver.from_yaml(ALIAS_YAML)),
+    )
+    assert cli.main(_bet_args(db_path, tmp_path / "t.jsonl")) == 0
+    out = capsys.readouterr().out
+    assert "oldest leg captured 72" in out
+    assert "WARNING" in out
+
+
+def test_append_prediction_preserves_earlier_records(tmp_path):
+    """Recording appends; it never rewrites a log that already holds trades."""
+    path = tmp_path / "trades.jsonl"
+    first = Prediction(series_id=1, period=1, selection="Spirit", prob=0.6, stake=10.0)
+    second = Prediction(series_id=1, period=2, selection="Aurora", prob=0.4, stake=20.0)
+    append_prediction(str(path), first)
+    append_prediction(str(path), second)
+    loaded = load_predictions(str(path))
+    assert [p.selection for p in loaded] == ["Spirit", "Aurora"]
+    assert [p.stake for p in loaded] == [10.0, 20.0]

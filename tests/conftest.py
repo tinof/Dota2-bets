@@ -28,6 +28,21 @@ def pinnacle_payload():
 
 
 @pytest.fixture
+def explorer_matches():
+    return load("explorer_matches.json")
+
+
+@pytest.fixture
+def explorer_picks_bans():
+    return load("explorer_picks_bans.json")
+
+
+@pytest.fixture
+def explorer_player_matches():
+    return load("explorer_player_matches.json")
+
+
+@pytest.fixture
 def conn(tmp_path):
     from dota2bets import storage
 

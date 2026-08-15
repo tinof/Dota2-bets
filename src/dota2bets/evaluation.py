@@ -36,6 +36,7 @@ import math
 import sqlite3
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .aliases import AliasResolver, Team, _norm
@@ -276,6 +277,10 @@ class Prediction:
     market_type: str = "moneyline"
     price_taken: float | None = None
     placed_at: int | None = None
+    stake: float | None = None
+    # When the quoted price was actually observed. Distinct from placed_at: a trade
+    # recorded now against a price seen an hour ago is not a price that was available.
+    quoted_at: int | None = None
 
 
 @dataclass(frozen=True)
@@ -460,3 +465,163 @@ def load_predictions(path: str) -> list[Prediction]:
                 raise ValueError(f"{path}:{lineno}: unknown prediction fields {sorted(unknown)}")
             out.append(Prediction(**obj))
     return out
+
+
+def append_prediction(path: str | Path, pred: Prediction) -> None:
+    """Append one prediction record as JSONL."""
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(p, "a", encoding="utf-8") as fh:
+        obj: dict[str, Any] = {
+            "series_id": pred.series_id,
+            "period": pred.period,
+            "selection": pred.selection,
+            "prob": round(pred.prob, 6),
+            "market_type": pred.market_type,
+        }
+        if pred.price_taken is not None:
+            obj["price_taken"] = pred.price_taken
+        if pred.placed_at is not None:
+            obj["placed_at"] = pred.placed_at
+        if pred.stake is not None:
+            obj["stake"] = pred.stake
+        if pred.quoted_at is not None:
+            obj["quoted_at"] = pred.quoted_at
+        fh.write(json.dumps(obj) + "\n")
+
+
+@dataclass(frozen=True)
+class PaperTradeResult:
+    prediction: Prediction
+    outcome: int | None
+    status: str  # "settled", "pending", "unresolved"
+    pnl: float | None
+    clv: float | None
+    closing_prob: float | None
+    closing_price: float | None
+    reason: str | None = None
+
+
+@dataclass
+class PaperSettlementReport:
+    trades: list[PaperTradeResult] = field(default_factory=list)
+    n_settled: int = 0
+    n_pending: int = 0
+    n_unresolved: int = 0
+    total_staked: float = 0.0
+    realised_pnl: float = 0.0
+    mean_clv: float | None = None
+    mean_edge_at_close: float | None = None
+
+
+def settle_paper_trades(
+    conn: sqlite3.Connection,
+    trades: Iterable[Prediction],
+    source: str = "pinnacle",
+    method: str = "shin",
+    resolver: AliasResolver | None = None,
+) -> PaperSettlementReport:
+    """Settle recorded paper trades against match outcomes and closing lines."""
+    resolver = resolver or AliasResolver.load()
+    report = PaperSettlementReport()
+    cache: dict[tuple[int, int, str], ClosingLine | None] = {}
+    clvs: list[float] = []
+    edges: list[float] = []
+
+    for pred in trades:
+        stake = pred.stake if pred.stake is not None else 0.0
+        team = resolver.resolve(pred.selection)
+        if team is None:
+            report.trades.append(
+                PaperTradeResult(
+                    prediction=pred,
+                    outcome=None,
+                    status="unresolved",
+                    pnl=None,
+                    clv=None,
+                    closing_prob=None,
+                    closing_price=None,
+                    reason="unresolved selection",
+                )
+            )
+            report.n_unresolved += 1
+            continue
+
+        key = (pred.series_id, pred.period, pred.market_type)
+        if key not in cache:
+            cache[key] = closing_probs(
+                conn,
+                source,
+                pred.series_id,
+                pred.period,
+                market_type=pred.market_type,
+                method=method,
+                before=None,
+            )
+        line = cache[key]
+        closing_prob = _lookup_prob(line.selections, pred.selection) if line else None
+        closing_price = _lookup_prob(line.prices, pred.selection) if line else None
+        clv = (
+            pred.price_taken * closing_prob - 1.0
+            if (pred.price_taken is not None and closing_prob is not None)
+            else None
+        )
+        if clv is not None:
+            clvs.append(clv)
+        if closing_prob is not None:
+            edges.append(pred.prob - closing_prob)
+
+        outcome, reason = resolve_outcome(conn, pred.series_id, pred.period, team)
+        if outcome is None:
+            # "map not played" is a map the series has not reached yet -- pending, not
+            # unresolved: the result is simply not recorded *yet*.
+            is_pending = reason in (
+                "series undecided",
+                "map undecided or team not in match",
+                "map not played",
+                None,
+            )
+            status = "pending" if is_pending else "unresolved"
+            report.trades.append(
+                PaperTradeResult(
+                    prediction=pred,
+                    outcome=None,
+                    status=status,
+                    pnl=None,
+                    clv=clv,
+                    closing_prob=closing_prob,
+                    closing_price=closing_price,
+                    reason=reason,
+                )
+            )
+            if status == "pending":
+                report.n_pending += 1
+            else:
+                report.n_unresolved += 1
+            continue
+
+        # Settled trade
+        if outcome == 1:
+            pnl = stake * ((pred.price_taken or 1.0) - 1.0)
+        else:
+            pnl = -stake
+
+        report.trades.append(
+            PaperTradeResult(
+                prediction=pred,
+                outcome=outcome,
+                status="settled",
+                pnl=pnl,
+                clv=clv,
+                closing_prob=closing_prob,
+                closing_price=closing_price,
+                reason=None,
+            )
+        )
+        report.n_settled += 1
+        report.total_staked += stake
+        report.realised_pnl += pnl
+
+    report.mean_clv = _mean(clvs)
+    report.mean_edge_at_close = _mean(edges)
+    return report

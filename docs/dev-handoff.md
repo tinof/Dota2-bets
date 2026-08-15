@@ -204,22 +204,126 @@ uv run dota2bets predict --out data/ti2026_preds.jsonl
 uv run dota2bets eval --predictions data/ti2026_preds.jsonl
 ```
 
+### Bulk history enrichment via Explorer (`dota2bets bulkfill`)
+
+Enriching match history via per-match `/matches/{id}` calls took ~14h and burned API quota.
+`dota2bets bulkfill` imports patch, drafts, players, teams, and rosters directly from OpenDota's
+PostgreSQL endpoint (`/api/explorer`) in 14-day date slices.
+
+**Verification against crawled data (~21.5k overlap):**
+- **Draft events:** 21,231 / 21,231 matches (509,328 events) — **100.0% exact match** on `(ord, hero_id, is_pick, team)`.
+- **Match players:** 21,555 / 21,555 matches (215,550 player rows) — **100.0% exact match** on `account_id`, `hero_id`, `is_radiant`, `kills`, `deaths`, `assists`, `gold_per_min`, `xp_per_min`.
+- **Patch index:** 21,555 / 21,555 (**100.0%**) exact match — *after* the fix below.
+
+**The patch trap, and why the overlap check nearly missed it.** Explorer's `match_patch`
+lags a release: matches played in the ~48h after 7.41 shipped (2026-03-24 00:50 UTC) are
+still labelled `'7.40'` months later. The first import trusted that label and *downgraded*
+194 already-correct matches from patch 60 to 59, verified wrong against
+`/matches/{id}` (which reports `patch: 60` for e.g. `8741426861`).
+
+Sweeping every row rather than only the flagged 194 found **750 wrong values**, not 194:
+the overlap control can only see the 21.5k matches the crawler had also fetched, and the
+older boundaries (patches 54–57, May 2024 → May 2025) were bulk-only and therefore
+unchecked. Boundary lag is the rule, not a one-off.
+
+The fix is `opendota.resolve_patch()`: derive the patch from `start_time` against
+`/constants/patch` release dates — what `/matches/{id}` itself does — and fall back to the
+label only when the start time cannot place the match. Patch date ranges are now exact
+(each patch starts on its release date, ends at the next) and the crawler overlap agrees on
+every row. Regression test: `test_patch_resolves_by_start_time_when_the_label_lags`.
+
+This mattered because `matches.patch` feeds the ratings' patch-transition feature: a stale
+label shifts a team's transition by days, precisely where the feature fires.
+- **Coverage:** **64,900 of 64,900 matches fully enriched (100.0%)**; 1,537,303 draft events and 649,000 player rows stored.
+- `bulkfill` is the primary enrichment path; `detail` remains as the per-match fallback. Timeseries is optionally available via `--with-timeseries`.
+
+### Phase 1b rating features: FINAL evaluation at 100% detail coverage
+
+`ratings.py` and `backtest.py` contain two uncertainty-widening mechanisms:
+1. **Per-patch rating windows (`patch_rd_boost`, `--patch-boost`):** inflates RD in quadrature on the first map of a newer patch.
+2. **Roster-stability penalty (`roster_rd_boost`, `--roster-boost`):** inflates RD in proportion to changed players (stand-ins), preloaded via `ratings.load_lineups(conn)`.
+3. Both features degrade gracefully to the Phase 1 baseline when data is absent or when configured as `None`.
+
+**Ablation and evaluation results — FINAL (100% coverage, 64,900 matches, re-run after the
+patch-boundary repair above; the pre-repair numbers were measured on 750 wrong patch values):**
+
+- **Baseline (both `None`):** Elite walk-forward Brier `0.2266` / log-loss `0.6441` (n=6638);
+  TI 2026 closing-market evaluation Brier `0.2993` (70 scored rows vs closing market Brier `0.2508`).
+- **Patch boost ablation (`--patch-boost 60`):** Elite walk-forward Brier `0.2265` / log-loss `0.6439`.
+- **Roster boost ablation (`--roster-boost 60`):** Elite walk-forward Brier `0.2263` / log-loss `0.6437`.
+- **Tuning grid (16 configs on historical holdout before TI):** top is `patch_boost=none`,
+  `roster_boost=30` at Brier `0.2255` / log-loss `0.6416`. Note `patch_boost=30` *ties* it to
+  four decimals — on corrected data the patch feature contributes essentially nothing, and
+  the entire historical gain is the roster term.
+- **Event benchmark (`roster_boost=30` on TI 2026):** Brier degrades to `0.3031` vs baseline
+  `0.2993` (closing line `0.2508`), on the same 70 scored rows.
+
+**Adoption decision — FINAL: defaults remain `None`.**
+Under the adoption rule (enable by default only if *both* historical elite Brier 0.2266 and
+TI 2026 event Brier 0.2993 improve), the features are rejected for defaults: `roster_boost=30`
+improves long-term history (0.2255 vs 0.2266) but adds noise in dense tournament play
+(0.3031 vs 0.2993). The repair did not change this verdict — it was reached twice, on wrong
+and then on correct data — but it did change *which* feature carries the historical gain.
+This settles Phase 1b: team ratings adjustments alone cannot close the ~0.05 gap to market closing lines. Phase 2 (draft models) is the next milestone.
+
+### Phase 2 draft model and live paper trading: FINAL evaluation
+
+The draft model (`draft.py`) integrates team ratings with 7 radiant-oriented draft features:
+1. **Hero pool win rates** with lazy exponential decay (`half_life_days=120`, default) and Bayesian shrinkage (`k_hero=20`).
+2. **Team-on-hero familiarity** with team win rate shrinkage (`k_team_hero=10`).
+3. **Same-side synergy pairs** with pair shrinkage (`k_pair=100`).
+4. **Cross-side matchup counters** with pair shrinkage (`k_pair=100`).
+5. **Draft order advantage** (opening first-action pick/ban indicator).
+6. **Combiner warmness indicator** (both teams have >= `min_team_games` maps on record, default **5**).
+7. **Anchor Glicko-2 logit** and historical Radiant intercept (+0.063 logit) combined via online AdaGrad logistic regression.
+
+#### Measurement and evaluation results
+
+- **Harness neutrality (Task 5.1):** `backtest --model draft --disable-draft` produces **Brier 0.2266 / log-loss 0.6441** on 6,638 matches (with 23 fallback maps), exactly replicating the Phase 1 ratings baseline.
+- **Historical elite walk-forward (Task 5.2):** Draft model scores **Brier 0.2287 / log-loss
+  0.6493** with default hyperparameters on 6,638 elite maps (23 fallback). This is *worse*
+  than the 0.2266 ratings baseline — draft features do not help over a long, mixed history.
+- **TI 2026 event evaluation (Task 7.1):** **Brier 0.2580 vs closing 0.2499**, on **50
+  scored maps** of 55 priced (0 fallbacks; 60 of 110 prediction rows have no captured
+  closing line).
+
+  **Compare only on the same rows.** The ratings baseline's 0.2993 was measured over **70**
+  rows, because `--model ratings` also emits period-0 series prices that the draft model
+  never produces — and those series rows alone score 0.3425. Scored on the *identical 50
+  map rows*, the comparison is:
+
+  | Model | Brier on the same 50 TI rows |
+  |---|---|
+  | Ratings | 0.2820 |
+  | **Draft** | **0.2580** |
+  | Closing market | 0.2498 |
+
+  So the draft model is worth ~0.024 Brier over ratings on maps it can price, and closes
+  the gap to the market from 0.032 to 0.008 — a real gain, but roughly half the size the
+  earlier 0.2618-vs-0.2993 framing implied. Never quote those two numbers against each
+  other again; they are different populations.
+- **Adoption decision (Task 7.4):** The draft model is available as `--model draft` on `backtest` and `predict` and powers `dota2bets bet`. Under the strict adoption rule, default CLI behaviour remains `--model ratings` for pre-match predictions where draft picks are not yet known.
+
+#### Live paper-trading workflow (`dota2bets bet`)
+
+During live series draft windows:
+```bash
+# Rehearsal mode (calculates probabilities and pricing without modifying trade log)
+uv run dota2bets bet --radiant am cm juggernaut lina sven --dire axe bane pudge invoker sniper --radiant-team "Team Spirit" --dire-team "Aurora Gaming" --period 2 --rehearse
+
+# Live trade (appends to data/paper_trades.jsonl with edge, Kelly sizing, price and quote time)
+# Refuses to record when the quote is older than --freshness-limit (default 300s);
+# --allow-stale overrides, which you should only do knowingly.
+uv run dota2bets bet --radiant am cm juggernaut lina sven --dire axe bane pudge invoker sniper --radiant-team "Team Spirit" --dire-team "Aurora Gaming" --period 2
+
+# Settle recorded paper trades against match outcomes and closing lines
+uv run dota2bets bet --settle
+```
+
 ## Next steps
 
-1. **Let the detail crawl finish** (~14h from 2026-08-14 14:30 local; resumable — just
-   re-run `dota2bets detail` with the key loaded if it stops). Detail coverage was the
-   binding constraint on Phase 1; after this it no longer is.
-2. **Phase 1b, once detail lands**: per-patch rating windows and a roster-stability
-   penalty (both need `match_players`, hence the crawl). Add them as *features on top of*
-   the Glicko baseline and re-run the same two commands — the 0.2266 elite Brier and the
-   0.2993 TI Brier are the numbers to beat, and any change that does not move both is not
-   an improvement.
-3. **The gap to close is 0.05 Brier, and ratings alone will not close it.** The market
-   prices roster news, patch reads and draft; the model prices none of them. The draft
-   model (Phase 2) is the one with a real shot, and `window_report.py` already proved
-   map-2/3 moneylines stay open through their drafts at $2,500 median max stake.
-4. Re-run `dota2bets resolve`, `predict` and `window_report.py` as TI progresses; all are
-   idempotent and cheap. Each finished series adds rows to the CLV comparison.
+1. Re-run `dota2bets resolve`, `predict` and `window_report.py` as TI progresses. Each finished series adds rows to the CLV comparison.
+2. Execute live paper trading via `dota2bets bet` during upcoming TI playoff matches.
 
 ## Gotchas worth not rediscovering
 
